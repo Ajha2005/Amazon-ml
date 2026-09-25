@@ -10,7 +10,7 @@ import pandas as pd
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(__file__))
-from normalize import normalize_dataframe
+from normalize_fast import normalize_in_chunks_fast
 from blocking_fast import get_candidates_fast
 from matcher_fast import score_candidates_vectorized, apply_threshold_fast, tune_thresholds_fast
 from scorer import evaluate, blocking_recall
@@ -59,18 +59,6 @@ def write_candidate_pairs(candidates_df, all_s1_ids, output_path):
     print(f"  Wrote {output_path}")
 
 
-def normalize_in_chunks(df, chunk_size=100000):
-    """Normalize large df in chunks to avoid memory issues."""
-    chunks = []
-    total = len(df)
-    for start in range(0, total, chunk_size):
-        end = min(start + chunk_size, total)
-        chunk = df.iloc[start:end].copy()
-        chunks.append(normalize_dataframe(chunk))
-        if start % (chunk_size * 5) == 0 and start > 0:
-            print(f"    Normalized {start}/{total}...")
-    return pd.concat(chunks, ignore_index=True)
-
 
 def run_pipeline(mode='test', top_k=10, t_match=None, t_empty=None):
     total_start = time.time()
@@ -87,12 +75,12 @@ def run_pipeline(mode='test', top_k=10, t_match=None, t_empty=None):
     print(f"  S1={len(s1)}, S2={len(s2)}, S3={len(s3)}, S2+S3={len(s2s3)}")
 
     # --- 2. Normalize ---
-    print("\n[2/6] Normalizing records...")
+    print("\n[2/6] Normalizing records (vectorized)...")
     t = time.time()
     print("  Normalizing S1...")
-    s1_norm = normalize_in_chunks(s1, chunk_size=100000)
+    s1_norm = normalize_in_chunks_fast(s1, chunk_size=500000)
     print("  Normalizing S2+S3...")
-    s2s3_norm = normalize_in_chunks(s2s3, chunk_size=100000)
+    s2s3_norm = normalize_in_chunks_fast(s2s3, chunk_size=500000)
     print(f"  Done in {time.time()-t:.0f}s")
 
     # --- 3. Block ---
