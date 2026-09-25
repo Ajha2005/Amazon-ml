@@ -1,130 +1,103 @@
 """
-Scalable blocking for 2M+ S1 records against 10M+ S2/S3 records.
-Strategy:
-  1. Partition by country (always consistent — confirmed by EDA)
-  2. Within each country: token inverted index + batched TF-IDF sparse cosine
-  3. Postal code exact match within country
+Fast inverted-index blocking for 2M+ S1 / 10M+ S2/S3.
+
+Strategy (no TF-IDF — too slow at this scale):
+  1. Partition by country (always consistent per EDA)
+  2. Build token inverted index on S2/S3 name tokens
+  3. For each S1, look up its name tokens → candidate S2/S3 records
+  4. Only use tokens with IDF above threshold (discriminative tokens)
+  5. Postal code exact-match blocking as a second pass
 """
 import numpy as np
 import pandas as pd
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 from collections import defaultdict
-import scipy.sparse as sp
+import math
 
 
-def build_token_index(df, text_col):
-    """Inverted index: token -> list of entity_ids"""
+def build_inverted_index(df, text_col):
+    """Build {token: [entity_id, ...]} index."""
     index = defaultdict(list)
-    for _, row in df.iterrows():
+    total = len(df)
+    for i, (_, row) in enumerate(df.iterrows()):
         text = row[text_col]
-        if not isinstance(text, str):
+        if not isinstance(text, str) or not text.strip():
             continue
         for token in set(text.split()):
             if len(token) >= 3:
                 index[token].append(row['entity_id'])
+        if i % 500000 == 0 and i > 0:
+            print(f"    Indexed {i:,}/{total:,} S2/S3 records...")
     return index
 
 
-def token_idf(index, total_docs):
-    """IDF for each token"""
-    return {t: np.log(total_docs / (1 + len(ids))) for t, ids in index.items()}
+def compute_idf(index, total_docs):
+    """IDF per token."""
+    return {t: math.log(total_docs / (1 + len(ids))) for t, ids in index.items()}
 
 
-def token_blocking_partition(s1_part, s2s3_part, text_col, min_idf=3.0):
-    """Shared rare token blocking within a country partition."""
-    total = len(s1_part) + len(s2s3_part)
-    s2s3_index = build_token_index(s2s3_part, text_col)
-    idf = token_idf(s2s3_index, total)
+def inverted_index_blocking(s1_part, s2s3_part, text_col,
+                             min_idf=2.0, max_candidates_per_token=500):
+    """
+    For each S1, find S2/S3 records sharing at least one rare name token.
+    min_idf=2.0 means token appears in <exp(-2)*N ≈ 13% of docs.
+    max_candidates_per_token: skip tokens that are too common (hotword cap).
+    """
+    total_docs = len(s2s3_part)
+    print(f"    Building inverted index on {total_docs:,} S2/S3 records...")
+    index = build_inverted_index(s2s3_part, text_col)
+    idf = compute_idf(index, total_docs)
+
+    # Filter: only keep tokens with high enough IDF and not too many matches
+    rare_index = {
+        t: ids for t, ids in index.items()
+        if idf.get(t, 0) >= min_idf and len(ids) <= max_candidates_per_token
+    }
+    print(f"    Retained {len(rare_index):,}/{len(index):,} discriminative tokens")
 
     pairs = []
-    for _, row in s1_part.iterrows():
+    total_s1 = len(s1_part)
+    for i, (_, row) in enumerate(s1_part.iterrows()):
+        if i % 200000 == 0 and i > 0:
+            print(f"    Looked up {i:,}/{total_s1:,} S1 records...")
         text = row[text_col]
-        if not isinstance(text, str):
+        if not isinstance(text, str) or not text.strip():
             continue
         cands = set()
         for token in set(text.split()):
-            if idf.get(token, 0) >= min_idf and len(token) >= 3:
-                cands.update(s2s3_index.get(token, []))
+            if token in rare_index:
+                cands.update(rare_index[token])
         for cand_id in cands:
             pairs.append((row['entity_id'], cand_id))
-    return pairs
-
-
-def tfidf_blocking_batched(s1_part, s2s3_part, text_col, top_k=10,
-                            batch_size=2000, ngram_range=(3, 4)):
-    """
-    Batched TF-IDF cosine blocking. Fits vectorizer on full corpus,
-    then scores S1 against S2/S3 in batches to avoid OOM.
-    """
-    s1_texts = s1_part[text_col].fillna('').tolist()
-    s2s3_texts = s2s3_part[text_col].fillna('').tolist()
-    s1_ids = s1_part['entity_id'].tolist()
-    s2s3_ids = s2s3_part['entity_id'].tolist()
-
-    print(f"    Fitting TF-IDF on {len(s1_texts)+len(s2s3_texts)} docs...")
-    vectorizer = TfidfVectorizer(
-        analyzer='char_wb',
-        ngram_range=ngram_range,
-        max_features=200000,
-        sublinear_tf=True,
-        min_df=2,
-    )
-    all_texts = s1_texts + s2s3_texts
-    vectorizer.fit(all_texts)
-
-    print(f"    Transforming S2/S3 ({len(s2s3_texts)} docs)...")
-    s2s3_matrix = vectorizer.transform(s2s3_texts)
-
-    pairs = []
-    n_s1 = len(s1_ids)
-    n_batches = (n_s1 + batch_size - 1) // batch_size
-    print(f"    Scoring {n_s1} S1 in {n_batches} batches...")
-
-    for b in range(n_batches):
-        if b % 10 == 0:
-            print(f"      Batch {b}/{n_batches}...")
-        start = b * batch_size
-        end = min(start + batch_size, n_s1)
-        s1_batch_texts = s1_texts[start:end]
-        s1_batch_ids = s1_ids[start:end]
-
-        s1_matrix = vectorizer.transform(s1_batch_texts)
-        sims = cosine_similarity(s1_matrix, s2s3_matrix)
-
-        for i in range(sims.shape[0]):
-            top_idx = np.argpartition(sims[i], -top_k)[-top_k:]
-            top_idx = top_idx[sims[i][top_idx] > 0.05]
-            for j in top_idx:
-                pairs.append((s1_batch_ids[i], s2s3_ids[j]))
 
     return pairs
 
 
-def postal_blocking_partition(s1_part, s2s3_part):
-    """Exact postal code match within country."""
+def postal_blocking(s1_part, s2s3_part):
+    """Exact postal code match within country partition."""
     s2s3_postal = defaultdict(list)
     for _, row in s2s3_part.iterrows():
         p = row.get('postal_code', '')
-        if p:
+        if p and len(p) >= 5:
             s2s3_postal[p].append(row['entity_id'])
 
     pairs = []
     for _, row in s1_part.iterrows():
         p = row.get('postal_code', '')
-        if p:
+        if p and len(p) >= 5:
             for cand_id in s2s3_postal.get(p, []):
                 pairs.append((row['entity_id'], cand_id))
     return pairs
 
 
-def get_candidates_fast(s1_norm, s2s3_norm, top_k=10):
+def get_candidates_fast(s1_norm, s2s3_norm, top_k=None):
     """
-    Country-partitioned blocking pipeline.
+    Country-partitioned inverted-index blocking.
+    top_k is unused (kept for API compatibility) — inverted index
+    naturally returns only records sharing discriminative tokens.
     Returns DataFrame(s1_id, cand_id).
     """
     all_pairs = []
-    countries = s1_norm['country'].unique()
+    countries = s1_norm['country'].dropna().unique()
     print(f"  Countries in S1: {list(countries)}")
 
     for country in countries:
@@ -132,32 +105,28 @@ def get_candidates_fast(s1_norm, s2s3_norm, top_k=10):
         s2s3_part = s2s3_norm[s2s3_norm['country'] == country].reset_index(drop=True)
 
         if len(s2s3_part) == 0:
-            print(f"  [{country}] No S2/S3 records — skipping")
+            print(f"  [{country}] No S2/S3 — skipping")
             continue
 
-        print(f"\n  [{country}] S1={len(s1_part)}, S2/S3={len(s2s3_part)}")
+        print(f"\n  [{country}] S1={len(s1_part):,}, S2/S3={len(s2s3_part):,}")
 
-        # 1. TF-IDF on name (char n-grams)
-        print(f"  [{country}] TF-IDF char n-gram blocking on names...")
-        pairs = tfidf_blocking_batched(
-            s1_part, s2s3_part, 'name_no_suffix',
-            top_k=top_k, batch_size=2000, ngram_range=(3, 4)
+        # Pass 1: token inverted index on cleaned name
+        print(f"  [{country}] Inverted index blocking on name tokens...")
+        pairs = inverted_index_blocking(
+            s1_part, s2s3_part,
+            text_col='name_no_suffix',
+            min_idf=2.0,
+            max_candidates_per_token=500,
         )
-        print(f"    -> {len(pairs)} pairs")
+        print(f"    -> {len(pairs):,} pairs from token blocking")
         all_pairs.extend(pairs)
 
-        # 2. Token blocking on name
-        print(f"  [{country}] Token blocking on names...")
-        pairs = token_blocking_partition(s1_part, s2s3_part, 'name_no_suffix', min_idf=3.0)
-        print(f"    -> {len(pairs)} pairs")
-        all_pairs.extend(pairs)
-
-        # 3. Postal code blocking
+        # Pass 2: postal code exact match
         print(f"  [{country}] Postal code blocking...")
-        pairs = postal_blocking_partition(s1_part, s2s3_part)
-        print(f"    -> {len(pairs)} pairs")
-        all_pairs.extend(pairs)
+        postal_pairs = postal_blocking(s1_part, s2s3_part)
+        print(f"    -> {len(postal_pairs):,} pairs from postal blocking")
+        all_pairs.extend(postal_pairs)
 
     result = pd.DataFrame(all_pairs, columns=['s1_id', 'cand_id']).drop_duplicates()
-    print(f"\n  Total unique candidate pairs: {len(result)}")
+    print(f"\n  Total unique candidate pairs: {len(result):,}")
     return result

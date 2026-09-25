@@ -35,13 +35,8 @@ ABBREV_MAP = {
 
 
 def _strip_accents_series(s: pd.Series) -> pd.Series:
-    import unicodedata
-    def _strip(text):
-        if not isinstance(text, str):
-            return ''
-        nfkd = unicodedata.normalize('NFKD', text)
-        return ''.join(c for c in nfkd if not unicodedata.combining(c))
-    return s.map(_strip)
+    # pandas str.normalize uses ICU (C backend) — much faster than Python map()
+    return s.str.normalize('NFKD').str.replace(r'[̀-ͯ]', '', regex=True)
 
 
 def normalize_names(series: pd.Series) -> pd.DataFrame:
