@@ -1,31 +1,42 @@
 #!/usr/bin/env python3
 """
-Scalable ML pipeline for 2M+ S1 records.
-Train mode: normalize → block → extract features → train LightGBM → evaluate
-Test mode:  normalize → block → extract features → load model → predict → write output
+End-to-end entity resolution pipeline.
+
+  train: normalize -> top-K blocking -> features -> LightGBM (S1-level holdout)
+         -> tune threshold on holdout -> save model + selection params
+  test:  normalize -> top-K blocking -> features -> load model -> select matches
+         -> output/matching_results.tsv + output/candidate_pairs.tsv
+
+Every stage is cached under cache/ so reruns skip finished work.
 """
+import argparse
+import gc
+import json
 import os
 import sys
-import gc
 import time
-import pandas as pd
+
 import numpy as np
+import pandas as pd
 
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from normalize_fast import normalize_in_chunks_fast
-from blocking_fast import get_candidates_fast
-from features import extract_features_batch
-from ml_scorer import train_model, predict_scores, load_model
-from matcher_fast import apply_threshold_fast, tune_thresholds_fast
-from scorer import evaluate, blocking_recall
+from blocking_fast import get_candidates_topk
+from features import compute_features, BACKEND, FEATURE_COLS
+from ml_scorer import (ground_truth_index, pair_labels, blocking_report,
+                       train_and_tune, predict, select_matches)
 
-BASE_DIR   = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
-TRAIN_DIR  = os.path.join(BASE_DIR, 'dataset', 'train')
-TEST_DIR   = os.path.join(BASE_DIR, 'dataset', 'test')
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..'))
+DATA_DIR = {'train': os.path.join(BASE_DIR, 'dataset', 'train'),
+            'test': os.path.join(BASE_DIR, 'dataset', 'test')}
 OUTPUT_DIR = os.path.join(BASE_DIR, 'output')
-MODEL_PATH = os.path.join(BASE_DIR, 'output', 'model.pkl')
+CACHE_DIR = os.path.join(BASE_DIR, 'cache')
+MODEL_PATH = os.path.join(OUTPUT_DIR, 'model.txt')
+PARAMS_PATH = os.path.join(OUTPUT_DIR, 'selection_params.json')
 
 NEEDED_COLS = ['entity_id', 'business_name', 'business_address', 'country']
+KEEP_NORM = ['entity_id', 'name_clean', 'name_no_suffix', 'legal_suffix', 'acronym',
+             'addr_expanded', 'postal_code', 'house_number', 'country']
 
 
 def _read_tsv(path):
@@ -34,147 +45,127 @@ def _read_tsv(path):
     return pd.read_csv(path, sep='\t', usecols=cols, dtype=str, na_filter=False)
 
 
-def load_data(data_dir, prefix):
-    print(f"  Loading {prefix}_source1.tsv...")
-    s1 = _read_tsv(os.path.join(data_dir, f'{prefix}_source1.tsv'))
-    print(f"    {len(s1):,} rows")
-    print(f"  Loading {prefix}_source2.tsv...")
-    s2 = _read_tsv(os.path.join(data_dir, f'{prefix}_source2.tsv'))
-    print(f"    {len(s2):,} rows")
-    print(f"  Loading {prefix}_source3.tsv...")
-    s3 = _read_tsv(os.path.join(data_dir, f'{prefix}_source3.tsv'))
-    print(f"    {len(s3):,} rows")
-    s2s3 = pd.concat([s2, s3], ignore_index=True)
-    del s2, s3; gc.collect()
-    return s1, s2s3
-
-
-def write_matching_results(matches, output_path):
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    with open(output_path, 'w') as f:
-        f.write('source1_entity_id\tmatched_entity_ids\n')
-        for s1_id in sorted(matches.keys()):
-            cands = sorted(set(matches[s1_id]))
-            f.write(f'{s1_id}\t{",".join(cands)}\n')
-    print(f"  Wrote {output_path}")
-
-
-def write_candidate_pairs(scores_df, all_s1_ids, output_path):
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    cand_dict = {s: [] for s in all_s1_ids}
-    for _, row in scores_df.iterrows():
-        cand_dict[row['s1_id']].append(row['cand_id'])
-    with open(output_path, 'w') as f:
-        f.write('source1_entity_id\tcandidate_entity_ids\n')
-        for s1_id in sorted(cand_dict.keys()):
-            cands = sorted(set(cand_dict[s1_id]))
-            f.write(f'{s1_id}\t{",".join(cands)}\n')
-    print(f"  Wrote {output_path}")
-
-
-def run_pipeline(mode='test', top_k=10, t_match=None, t_empty=None):
-    total_start = time.time()
-
-    # --- 1. Load ---
-    print("\n[1/6] Loading data...")
-    if mode in ('train', 'validate'):
-        s1, s2s3 = load_data(TRAIN_DIR, 'train')
-        gt = pd.read_csv(os.path.join(TRAIN_DIR, 'train_ground_truth.tsv'),
-                         sep='\t', dtype=str, na_filter=False)
-    else:
-        s1, s2s3 = load_data(TEST_DIR, 'test')
-        gt = None
-    print(f"  S1={len(s1):,}, S2+S3={len(s2s3):,}")
-    all_s1_ids = s1['entity_id'].tolist()
-
-    # --- 2. Normalize ---
-    print("\n[2/6] Normalizing records...")
-    t = time.time()
-    s1_norm = normalize_in_chunks_fast(s1, chunk_size=500000)
-    del s1; gc.collect()
-    s2s3_norm = normalize_in_chunks_fast(s2s3, chunk_size=500000)
-    del s2s3; gc.collect()
-    print(f"  Done in {time.time()-t:.0f}s")
-
-    # --- 3. Block ---
-    print("\n[3/6] Generating candidates...")
-    t = time.time()
-    candidates = get_candidates_fast(s1_norm, s2s3_norm, top_k=top_k)
-    print(f"  Blocking done in {time.time()-t:.0f}s — {len(candidates):,} pairs")
-
-    if gt is not None:
-        print("  Measuring blocking recall...")
-        blocking_recall(candidates, gt)
-
-    # --- 4. Extract features ---
-    print("\n[4/6] Extracting features...")
-    t = time.time()
-    features_df = extract_features_batch(candidates, s1_norm, s2s3_norm)
-    del candidates; gc.collect()
-    print(f"  Done in {time.time()-t:.0f}s")
-
-    # --- 5. Train or load ML model ---
-    if mode in ('train', 'validate') and gt is not None:
-        print("\n[5/6] Training ML model on ground truth...")
+def _cached(path, build):
+    if os.path.exists(path):
         t = time.time()
-        model = train_model(features_df, gt, MODEL_PATH)
-        print(f"  Training done in {time.time()-t:.0f}s")
-    else:
-        print("\n[5/6] Loading ML model...")
-        model = load_model(MODEL_PATH)
-        if model is None:
-            print("  No model found — run with --mode train first!")
-            print("  Falling back to hand-tuned scorer...")
-            # fallback: use name_jw as score
-            from matcher_fast import score_candidates_vectorized
-            scores_df = score_candidates_vectorized(features_df[['s1_id','cand_id']], s1_norm, s2s3_norm)
-        else:
-            scores_df = None  # will be set below
+        obj = pd.read_pickle(path)
+        print(f"  Loaded cache {os.path.basename(path)} ({time.time() - t:.0f}s)")
+        return obj
+    obj = build()
+    t = time.time()
+    pd.to_pickle(obj, path)
+    print(f"  Cached -> {os.path.basename(path)} ({time.time() - t:.0f}s)")
+    return obj
 
-    # --- Score ---
-    scores_df = predict_scores(features_df, model)
-    del features_df; gc.collect()
 
-    # --- Threshold tuning ---
-    if t_match is None or t_empty is None:
-        if gt is not None:
-            print("\n  Tuning thresholds...")
-            t_match, t_empty, val_f05 = tune_thresholds_fast(scores_df, gt, all_s1_ids)
-        else:
-            t_match, t_empty = 0.35, 0.25
-            print(f"\n  Using default ML thresholds: t_match={t_match}, t_empty={t_empty}")
-    else:
-        print(f"\n  Using provided thresholds: t_match={t_match}, t_empty={t_empty}")
+def load_normalized(mode):
+    def build():
+        d = DATA_DIR[mode]
+        frames = {}
+        for src in ('source1', 'source2', 'source3'):
+            frames[src] = _read_tsv(os.path.join(d, f'{mode}_{src}.tsv'))
+            print(f"  {mode}_{src}.tsv: {len(frames[src]):,} rows")
+        t = time.time()
+        s1 = normalize_in_chunks_fast(frames['source1'])[KEEP_NORM]
+        c = normalize_in_chunks_fast(
+            pd.concat([frames['source2'], frames['source3']], ignore_index=True))[KEEP_NORM]
+        c['src'] = np.r_[np.zeros(len(frames['source2']), np.int8),
+                         np.ones(len(frames['source3']), np.int8)]
+        print(f"  Normalized in {time.time() - t:.0f}s")
+        return s1, c
+    return _cached(os.path.join(CACHE_DIR, f'{mode}_norm.pkl'), build)
 
-    # --- 6. Apply & write ---
-    print("\n[6/6] Applying thresholds and writing output...")
-    matches = apply_threshold_fast(scores_df, all_s1_ids, t_match=t_match, t_empty=t_empty)
 
-    if gt is not None:
-        pred_rows = [{'source1_entity_id': sid,
-                      'matched_entity_ids': ','.join(sorted(set(matches.get(sid, []))))}
-                     for sid in all_s1_ids]
-        pred_df = pd.DataFrame(pred_rows)
-        macro_f05, _ = evaluate(pred_df, gt)
-        print(f"\n  *** Macro F0.5 on {mode} data: {macro_f05:.4f} ***")
+def build_pairs(mode, k, df_cap):
+    print(f"\n[1/4] Loading + normalizing {mode} data...")
+    s1, c = load_normalized(mode)
+    print(f"  S1={len(s1):,}  S2+S3={len(c):,}")
 
-    if mode == 'test':
-        write_matching_results(matches, os.path.join(OUTPUT_DIR, 'matching_results.tsv'))
-        write_candidate_pairs(scores_df, all_s1_ids,
-                              os.path.join(OUTPUT_DIR, 'candidate_pairs.tsv'))
+    print(f"\n[2/4] Blocking (top-{k} per S1, df_cap={df_cap})...")
+    cands = _cached(os.path.join(CACHE_DIR, f'{mode}_cands_k{k}_cap{df_cap}.pkl'),
+                    lambda: get_candidates_topk(s1, c, k=k, df_cap=df_cap))
 
-    elapsed = time.time() - total_start
-    print(f"\nTotal time: {elapsed/60:.1f} minutes")
-    return matches, scores_df
+    print(f"\n[3/4] Features...")
+    feats = _cached(os.path.join(CACHE_DIR, f'{mode}_feats_k{k}_cap{df_cap}_{BACKEND}.pkl'),
+                    lambda: compute_features(cands.copy(), s1, c))
+    del cands
+    s1_ids = s1['entity_id'].to_numpy(dtype=object)
+    c_ids = c['entity_id'].to_numpy(dtype=object)
+    del s1, c
+    gc.collect()
+    return feats, s1_ids, c_ids
+
+
+def run_train(k, df_cap):
+    feats, s1_ids, c_ids = build_pairs('train', k, df_cap)
+    gt = pd.read_csv(os.path.join(DATA_DIR['train'], 'train_ground_truth.tsv'),
+                     sep='\t', dtype=str, na_filter=False)
+    true_count, true_keys = ground_truth_index(gt, s1_ids, c_ids)
+    labels = pair_labels(feats, true_keys, len(c_ids))
+    del gt, true_keys
+    print(f"  S1 with no true match (singletons): {(true_count == 0).mean():.2%}")
+    blocking_report(feats, labels, true_count)
+
+    print(f"\n[4/4] Training LightGBM...")
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    train_and_tune(feats, labels, true_count, len(s1_ids), MODEL_PATH, PARAMS_PATH,
+                   backend=BACKEND)
+
+
+def _write_grouped(path, col, s1_ids, c_ids, s1_idx, c_idx):
+    order = np.lexsort((c_idx, s1_idx))
+    df = pd.DataFrame({'s': s1_idx[order], 'c': c_ids[c_idx[order]]})
+    joined = df.groupby('s', sort=False)['c'].agg(','.join)
+    values = np.full(len(s1_ids), '', dtype=object)
+    values[joined.index.to_numpy()] = joined.to_numpy(dtype=object)
+    pd.DataFrame({'source1_entity_id': s1_ids, col: values}).to_csv(path, sep='\t', index=False)
+    print(f"  Wrote {path}")
+
+
+def run_test(k, df_cap):
+    import lightgbm as lgb
+    with open(PARAMS_PATH) as f:
+        params = json.load(f)
+    if params.get('backend') != BACKEND:
+        print(f"  WARNING: model trained with {params.get('backend')} features, "
+              f"now using {BACKEND} — scores may be off")
+    if params.get('features') != FEATURE_COLS:
+        sys.exit("Feature list changed since training — retrain with --mode train")
+    booster = lgb.Booster(model_file=MODEL_PATH)
+    print(f"  Loaded model + params: {params}")
+
+    feats, s1_ids, c_ids = build_pairs('test', k, df_cap)
+
+    print(f"\n[4/4] Scoring + writing output...")
+    prob = predict(booster, feats)
+    s1_idx = feats['s1_idx'].to_numpy()
+    c_idx = feats['c_idx'].to_numpy()
+    s1_max = pd.Series(prob).groupby(s1_idx).transform('max').to_numpy()
+    sel = select_matches(s1_idx, c_idx, prob, params['threshold'], params['rel'],
+                         s1_max, params['resolve'])
+    n_matched = len(np.unique(s1_idx[sel]))
+    print(f"  {len(sel):,} matched pairs; {n_matched:,}/{len(s1_ids):,} S1 records have >=1 match")
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    _write_grouped(os.path.join(OUTPUT_DIR, 'matching_results.tsv'), 'matched_entity_ids',
+                   s1_ids, c_ids, s1_idx[sel], c_idx[sel])
+    _write_grouped(os.path.join(OUTPUT_DIR, 'candidate_pairs.tsv'), 'candidate_entity_ids',
+                   s1_ids, c_ids, s1_idx, c_idx)
 
 
 if __name__ == '__main__':
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--mode', choices=['train', 'validate', 'test'], default='train')
-    parser.add_argument('--top-k', type=int, default=10)
-    parser.add_argument('--t-match', type=float, default=None)
-    parser.add_argument('--t-empty', type=float, default=None)
-    args = parser.parse_args()
-    run_pipeline(mode=args.mode, top_k=args.top_k,
-                 t_match=args.t_match, t_empty=args.t_empty)
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--mode', choices=['train', 'test', 'both'], default='both')
+    ap.add_argument('--k', type=int, default=20, help='candidates kept per S1 record')
+    ap.add_argument('--df-cap', type=int, default=1000,
+                    help='drop blocking tokens found in more S2/S3 records than this')
+    args = ap.parse_args()
+
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    start = time.time()
+    if args.mode in ('train', 'both'):
+        run_train(args.k, args.df_cap)
+        gc.collect()
+    if args.mode in ('test', 'both'):
+        run_test(args.k, args.df_cap)
+    print(f"\nTotal time: {(time.time() - start) / 60:.1f} min")

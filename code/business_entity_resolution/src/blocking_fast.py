@@ -1,142 +1,136 @@
 """
-Fast inverted-index blocking for 2M+ S1 / 10M+ S2/S3.
+Candidate generation: IDF-weighted token overlap, top-K per Source 1 record.
 
-Strategy (no TF-IDF — too slow at this scale):
-  1. Partition by country (always consistent per EDA)
-  2. Build token inverted index on S2/S3 name tokens
-  3. For each S1, look up its name tokens → candidate S2/S3 records
-  4. Only use tokens with IDF above threshold (discriminative tokens)
-  5. Postal code exact-match blocking as a second pass
+Name, address and postal tokens are vectorized into one sparse vocabulary
+(separate vocabularies per field, so "main" in a name and "main" in an address
+are different tokens). Composite tokens — adjacent-word bigrams and
+name-word@postcode — stay rare for chains and generic names whose single words
+are too common to block on. Tokens present in more than `df_cap` Source 2/3
+records are dropped, the rest are weighted by IDF, and S1 x S2/S3 overlap
+scores come from a chunked sparse matrix product. Only the `k` best-scoring
+candidates per S1 record are kept. Runs independently per country.
 """
+import multiprocessing as mp
+import time
+
 import numpy as np
 import pandas as pd
-from collections import defaultdict
-import math
+import scipy.sparse as sp
+from sklearn.feature_extraction.text import CountVectorizer
+
+_G = {}
 
 
-def build_inverted_index(df, text_col):
-    """Build {token: [entity_id, ...]} index."""
-    index = defaultdict(list)
-    total = len(df)
-    for i, (_, row) in enumerate(df.iterrows()):
-        text = row[text_col]
-        if not isinstance(text, str) or not text.strip():
-            continue
-        for token in set(text.split()):
-            if len(token) >= 3:
-                index[token].append(row['entity_id'])
-        if i % 500000 == 0 and i > 0:
-            print(f"    Indexed {i:,}/{total:,} S2/S3 records...")
-    return index
+def _text(df, col):
+    return df[col].fillna('').to_numpy(dtype=object)
 
 
-def compute_idf(index, total_docs):
-    """IDF per token."""
-    return {t: math.log(total_docs / (1 + len(ids))) for t, ids in index.items()}
+def _bigrams(texts):
+    return [' '.join(a + '_' + b for a, b in zip(t, t[1:])) for t in (s.split() for s in texts)]
 
 
-def inverted_index_blocking(s1_part, s2s3_part, text_col,
-                             min_idf=2.0, max_candidates_per_token=200,
-                             min_shared_tokens=2):
-    """
-    For each S1, find S2/S3 records sharing >= min_shared_tokens rare name tokens.
-    Requiring 2+ shared tokens reduces pairs ~8x vs 1-token match with minimal recall loss.
-    Entities with only 1 discriminative token fall back to 1-token matching.
-    """
-    total_docs = len(s2s3_part)
-    print(f"    Building inverted index on {total_docs:,} S2/S3 records...")
-    index = build_inverted_index(s2s3_part, text_col)
-    idf = compute_idf(index, total_docs)
-
-    rare_index = {
-        t: ids for t, ids in index.items()
-        if idf.get(t, 0) >= min_idf and len(ids) <= max_candidates_per_token
+def _fields(df):
+    name = _text(df, 'name_no_suffix')
+    addr = _text(df, 'addr_expanded')
+    postal = _text(df, 'postal_code')
+    return {
+        'name': name,
+        'addr': addr,
+        'postal': postal,
+        'name_bigram': _bigrams(name),
+        'addr_bigram': _bigrams(addr),
+        'name_postal': [' '.join(w + '@' + p for w in s.split()) if p else ''
+                        for s, p in zip(name, postal)],
     }
-    print(f"    Retained {len(rare_index):,}/{len(index):,} discriminative tokens")
 
-    pairs = []
-    total_s1 = len(s1_part)
-    for i, (_, row) in enumerate(s1_part.iterrows()):
-        if i % 200000 == 0 and i > 0:
-            print(f"    Looked up {i:,}/{total_s1:,} S1 records...")
-        text = row[text_col]
-        if not isinstance(text, str) or not text.strip():
+
+def _field_matrices(s1_part, c_part):
+    f1, f2 = _fields(s1_part), _fields(c_part)
+    x1, x2 = [], []
+    for field in f2:
+        vec = CountVectorizer(token_pattern=r'\S+', lowercase=False,
+                              binary=True, dtype=np.float32)
+        try:
+            b = vec.fit_transform(f2[field])
+        except ValueError:  # field empty everywhere in this partition
             continue
-
-        # Count how many discriminative tokens each candidate shares with this S1
-        token_hits = defaultdict(int)
-        matched_tokens = 0
-        for token in set(text.split()):
-            if token in rare_index:
-                matched_tokens += 1
-                for cand_id in rare_index[token]:
-                    token_hits[cand_id] += 1
-
-        # Require 2+ shared tokens; fall back to 1 if entity has only 1 discriminative token
-        threshold = min_shared_tokens if matched_tokens >= min_shared_tokens else 1
-        for cand_id, hits in token_hits.items():
-            if hits >= threshold:
-                pairs.append((row['entity_id'], cand_id))
-
-    return pairs
+        x2.append(b)
+        x1.append(vec.transform(f1[field]))
+    return sp.hstack(x1).tocsr(), sp.hstack(x2).tocsr()
 
 
-def postal_blocking(s1_part, s2s3_part):
-    """Exact postal code match within country partition."""
-    s2s3_postal = defaultdict(list)
-    for _, row in s2s3_part.iterrows():
-        p = row.get('postal_code', '')
-        if p and len(p) >= 5:
-            s2s3_postal[p].append(row['entity_id'])
+def _topk_chunk(bounds):
+    start, end = bounds
+    k = _G['k']
+    s = (_G['x1'][start:end] @ _G['bt']).tocsr()
+    counts = np.diff(s.indptr)
+    if s.nnz == 0:
+        return (np.empty(0, np.int32),) * 2 + (np.empty(0, np.float32), np.empty(0, np.int16))
+    rows = np.repeat(np.arange(end - start, dtype=np.int64), counts)
+    order = np.argsort(rows * 1e6 - s.data, kind='stable')
+    rank = np.arange(s.nnz) - np.repeat(s.indptr[:-1], counts)
+    keep = rank < k
+    sel = order[keep]
+    return ((rows[sel] + start).astype(np.int32), s.indices[sel].astype(np.int32),
+            s.data[sel].astype(np.float32), rank[keep].astype(np.int16))
 
-    pairs = []
-    for _, row in s1_part.iterrows():
-        p = row.get('postal_code', '')
-        if p and len(p) >= 5:
-            for cand_id in s2s3_postal.get(p, []):
-                pairs.append((row['entity_id'], cand_id))
-    return pairs
+
+def _block_partition(s1_part, c_part, k, df_cap, chunk, workers):
+    x1, x2 = _field_matrices(s1_part, c_part)
+    n_c = x2.shape[0]
+    df = np.asarray(x2.sum(axis=0)).ravel()
+    keep_cols = np.flatnonzero((df > 0) & (df <= df_cap))
+    idf = np.log(n_c / df[keep_cols]).astype(np.float32)
+    print(f"    vocab {len(df):,} tokens, kept {len(keep_cols):,} with df <= {df_cap}")
+
+    _G['x1'] = (x1[:, keep_cols] @ sp.diags(idf)).tocsr()
+    _G['bt'] = x2[:, keep_cols].T.tocsr()
+    _G['k'] = k
+    del x1, x2
+
+    n1 = s1_part.shape[0]
+    bounds = [(i, min(i + chunk, n1)) for i in range(0, n1, chunk)]
+    if workers > 1 and 'fork' in mp.get_all_start_methods():
+        with mp.get_context('fork').Pool(workers) as pool:
+            parts = pool.map(_topk_chunk, bounds, chunksize=1)
+    else:
+        parts = [_topk_chunk(b) for b in bounds]
+    _G.clear()
+    return [np.concatenate(p) for p in zip(*parts)]
 
 
-def get_candidates_fast(s1_norm, s2s3_norm, top_k=None):
+def get_candidates_topk(s1_norm, s2s3_norm, k=50, df_cap=1000, chunk=4000, workers=None):
     """
-    Country-partitioned inverted-index blocking.
-    top_k is unused (kept for API compatibility) — inverted index
-    naturally returns only records sharing discriminative tokens.
-    Returns DataFrame(s1_id, cand_id).
+    Returns DataFrame(s1_idx, c_idx, block_score, block_rank) where the indices
+    are row positions in s1_norm / s2s3_norm and block_rank is 0 for the best
+    candidate of each S1 record.
     """
-    all_pairs = []
-    countries = s1_norm['country'].dropna().unique()
-    print(f"  Countries in S1: {list(countries)}")
+    workers = workers or min(4, mp.cpu_count())
+    s1_country = s1_norm['country'].fillna('').to_numpy(dtype=object)
+    c_country = s2s3_norm['country'].fillna('').to_numpy(dtype=object)
+    countries = pd.unique(s1_country)
+    print(f"  Countries in S1: {list(countries)} | in S2/S3: {list(pd.unique(c_country))}")
 
+    out = []
     for country in countries:
-        s1_part = s1_norm[s1_norm['country'] == country].reset_index(drop=True)
-        s2s3_part = s2s3_norm[s2s3_norm['country'] == country].reset_index(drop=True)
-
-        if len(s2s3_part) == 0:
-            print(f"  [{country}] No S2/S3 — skipping")
+        s1_pos = np.flatnonzero(s1_country == country)
+        c_pos = np.flatnonzero(c_country == country)
+        if len(c_pos) == 0:
+            print(f"  [{country}] no S2/S3 records — {len(s1_pos):,} S1 records get no candidates")
             continue
+        t = time.time()
+        print(f"  [{country}] S1={len(s1_pos):,}  S2/S3={len(c_pos):,}")
+        r, c, score, rank = _block_partition(
+            s1_norm.iloc[s1_pos], s2s3_norm.iloc[c_pos], k, df_cap, chunk, workers)
+        out.append(pd.DataFrame({
+            's1_idx': s1_pos[r].astype(np.int32),
+            'c_idx': c_pos[c].astype(np.int32),
+            'block_score': score,
+            'block_rank': rank,
+        }))
+        print(f"    -> {len(r):,} pairs in {time.time() - t:.0f}s")
 
-        print(f"\n  [{country}] S1={len(s1_part):,}, S2/S3={len(s2s3_part):,}")
-
-        # Pass 1: token inverted index on cleaned name
-        print(f"  [{country}] Inverted index blocking on name tokens...")
-        pairs = inverted_index_blocking(
-            s1_part, s2s3_part,
-            text_col='name_no_suffix',
-            min_idf=2.0,
-            max_candidates_per_token=200,
-            min_shared_tokens=2,
-        )
-        print(f"    -> {len(pairs):,} pairs from token blocking")
-        all_pairs.extend(pairs)
-
-        # Pass 2: postal code exact match
-        print(f"  [{country}] Postal code blocking...")
-        postal_pairs = postal_blocking(s1_part, s2s3_part)
-        print(f"    -> {len(postal_pairs):,} pairs from postal blocking")
-        all_pairs.extend(postal_pairs)
-
-    result = pd.DataFrame(all_pairs, columns=['s1_id', 'cand_id']).drop_duplicates()
-    print(f"\n  Total unique candidate pairs: {len(result):,}")
-    return result
+    cands = pd.concat(out, ignore_index=True)
+    print(f"  Total candidate pairs: {len(cands):,} "
+          f"({len(cands) / max(len(s1_norm), 1):.1f} per S1 record)")
+    return cands
