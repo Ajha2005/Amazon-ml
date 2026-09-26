@@ -1,11 +1,14 @@
 """
-Feature extraction for candidate pairs.
-17 features covering name, address, postal, acronym similarity.
+Feature extraction for candidate pairs — parallel version using fork.
+Workers inherit lookup dicts via OS copy-on-write (Linux/Kaggle).
 """
+import multiprocessing as mp
 import pandas as pd
 import numpy as np
 from difflib import SequenceMatcher
 
+
+# ── string similarity ──────────────────────────────────────────────────────────
 
 def _jaro(s1, s2):
     if s1 == s2: return 1.0
@@ -25,13 +28,15 @@ def _jaro(s1, s2):
         while not m2[k]: k += 1
         if s1[i] != s2[k]: t += 1
         k += 1
-    return (matches/l1 + matches/l2 + (matches-t/2)/matches) / 3
+    return (matches/l1 + matches/l2 + (matches - t/2)/matches) / 3
 
 
 def _jw(s1, s2, p=0.1):
     j = _jaro(s1, s2)
-    px = sum(1 for i in range(min(4, len(s1), len(s2)))
-             if s1[i] == s2[i] and all(s1[x] == s2[x] for x in range(i)))
+    px = 0
+    for i in range(min(4, len(s1), len(s2))):
+        if s1[i] == s2[i]: px += 1
+        else: break
     return j + px * p * (1 - j)
 
 
@@ -41,21 +46,23 @@ def _ratio(s1, s2):
 
 def _tsr(s1, s2):
     t1, t2 = set(s1.split()), set(s2.split())
-    inter, d1, d2 = t1&t2, t1-t2, t2-t1
+    inter, d1, d2 = t1 & t2, t1 - t2, t2 - t1
     t0 = ' '.join(sorted(inter))
-    a = ' '.join(sorted(inter)+sorted(d1))
-    b = ' '.join(sorted(inter)+sorted(d2))
-    return max(SequenceMatcher(None,t0,a).ratio(),
-               SequenceMatcher(None,t0,b).ratio(),
-               SequenceMatcher(None,a,b).ratio())
+    a  = ' '.join(sorted(inter) + sorted(d1))
+    b  = ' '.join(sorted(inter) + sorted(d2))
+    return max(SequenceMatcher(None, t0, a).ratio(),
+               SequenceMatcher(None, t0, b).ratio(),
+               SequenceMatcher(None, a,  b).ratio())
 
 
 def _jaccard(s1, s2):
     t1, t2 = set(s1.split()), set(s2.split())
     if not t1 and not t2: return 1.0
-    if not t1 or not t2: return 0.0
+    if not t1 or  not t2: return 0.0
     return len(t1 & t2) / len(t1 | t2)
 
+
+# ── feature column list ────────────────────────────────────────────────────────
 
 FEATURE_COLS = [
     'name_jw', 'name_tsr', 'name_ratio', 'name_exact',
@@ -67,44 +74,48 @@ FEATURE_COLS = [
 ]
 
 
-def extract_features_batch(candidates_df, s1_norm, s2s3_norm, batch_size=10000):
-    """
-    Extract features for all candidate pairs.
-    Returns DataFrame with s1_id, cand_id, label(if present), + FEATURE_COLS.
-    """
-    s1_dict = s1_norm.set_index('entity_id').to_dict('index')
-    c_dict  = s2s3_norm.set_index('entity_id').to_dict('index')
+# ── global lookup dicts (inherited by fork workers) ────────────────────────────
 
+_W_S1: dict = {}
+_W_C:  dict = {}
+
+
+def _build_lookup(norm_df: pd.DataFrame) -> dict:
+    """
+    Build compact tuple lookup: entity_id -> (name_no_suffix, addr_expanded,
+    postal_code, acronym, legal_suffix).
+    Vectorized — fast even for 10M rows.
+    """
+    cols = ['name_no_suffix', 'addr_expanded', 'postal_code', 'acronym', 'legal_suffix']
+    present = [c for c in cols if c in norm_df.columns]
+    sub = norm_df[['entity_id'] + present].fillna('')
+    # pad missing columns with empty strings
+    for c in cols:
+        if c not in sub.columns:
+            sub[c] = ''
+    arrays = [sub[c].values for c in cols]
+    return {eid: tuple(a[i] for a in arrays)
+            for i, eid in enumerate(sub['entity_id'].values)}
+
+
+# ── worker function (module-level so fork can inherit it) ─────────────────────
+
+def _worker_extract(pair_list: list) -> list:
+    """Extract features for one chunk of (s1_id, cand_id) pairs."""
     rows = []
-    total = len(candidates_df)
-    print(f"  Extracting features for {total:,} pairs...")
-
-    for i, (_, row) in enumerate(candidates_df.iterrows()):
-        if i % 500000 == 0 and i > 0:
-            print(f"    {i:,}/{total:,}...")
-
-        s1 = s1_dict.get(row['s1_id'], {})
-        c  = c_dict.get(row['cand_id'], {})
-
-        n1 = s1.get('name_no_suffix', '') or ''
-        n2 = c.get('name_no_suffix', '') or ''
-        a1 = s1.get('addr_expanded', '') or ''
-        a2 = c.get('addr_expanded', '') or ''
-        p1 = s1.get('postal_code', '') or ''
-        p2 = c.get('postal_code', '') or ''
-        ac1 = s1.get('acronym', '') or ''
-        ac2 = c.get('acronym', '') or ''
-        sf1 = s1.get('legal_suffix', '') or ''
-        sf2 = c.get('legal_suffix', '') or ''
+    for s1_id, cand_id in pair_list:
+        sv = _W_S1.get(s1_id, ('', '', '', '', ''))
+        cv = _W_C.get(cand_id,  ('', '', '', '', ''))
+        n1, a1, p1, ac1, sf1 = sv
+        n2, a2, p2, ac2, sf2 = cv
 
         t1 = n1.split()
         t2 = n2.split()
         common = len(set(t1) & set(t2))
 
-        feat = {
-            's1_id':   row['s1_id'],
-            'cand_id': row['cand_id'],
-            # Name similarity
+        rows.append({
+            's1_id':   s1_id,
+            'cand_id': cand_id,
             'name_jw':           _jw(n1, n2),
             'name_tsr':          _tsr(n1, n2),
             'name_ratio':        _ratio(n1, n2),
@@ -115,20 +126,56 @@ def extract_features_batch(candidates_df, s1_norm, s2s3_norm, batch_size=10000):
             'name_len_ratio':    min(len(n1), len(n2)) / max(len(n1), len(n2), 1),
             'name_common_tokens': common,
             'name_len_diff':     abs(len(t1) - len(t2)),
-            # Entity type
             'suffix_match':      float(sf1 == sf2 and sf1 != ''),
             'acronym_match':     float(
-                (ac1 and ac1 == n2) or (ac2 and ac2 == n1) or
-                (ac1 and ac2 and ac1 == ac2)
+                bool((ac1 and ac1 == n2) or (ac2 and ac2 == n1) or
+                     (ac1 and ac2 and ac1 == ac2))
             ),
-            # Address
             'addr_tsr':      _tsr(a1, a2),
             'addr_jw':       _jw(a1, a2),
-            # Postal
-            'postal_exact':   float(bool(p1 and p2 and p1 == p2)),
-            'postal_prefix':  float(bool(p1 and p2 and len(p1)>=3 and len(p2)>=3 and p1[:3]==p2[:3])),
+            'postal_exact':  float(bool(p1 and p2 and p1 == p2)),
+            'postal_prefix': float(bool(p1 and p2 and len(p1) >= 3
+                                        and len(p2) >= 3 and p1[:3] == p2[:3])),
             'postal_present': float(bool(p1 and p2)),
-        }
-        rows.append(feat)
+        })
+    return rows
 
-    return pd.DataFrame(rows)
+
+# ── public API ─────────────────────────────────────────────────────────────────
+
+def extract_features_batch(candidates_df, s1_norm, s2s3_norm,
+                            n_workers=None, batch_size=None):
+    """
+    Extract features for all candidate pairs.
+    Uses multiprocessing fork on Linux (Kaggle) for ~3-4x speedup.
+    n_workers=None → auto (min(4, cpu_count)); set to 1 to disable parallelism.
+    """
+    global _W_S1, _W_C
+
+    total = len(candidates_df)
+
+    # Determine workers
+    if n_workers is None:
+        n_workers = min(4, mp.cpu_count())
+    print(f"  Building compact lookups for {len(s1_norm):,} S1 + {len(s2s3_norm):,} S2/S3...")
+    _W_S1 = _build_lookup(s1_norm)
+    _W_C  = _build_lookup(s2s3_norm)
+
+    pairs = list(zip(candidates_df['s1_id'].values,
+                     candidates_df['cand_id'].values))
+
+    if n_workers == 1:
+        print(f"  Extracting {total:,} pairs (single-threaded)...")
+        all_rows = _worker_extract(pairs)
+    else:
+        chunk_size = (total + n_workers - 1) // n_workers
+        chunks = [pairs[i:i + chunk_size] for i in range(0, total, chunk_size)]
+        print(f"  Extracting {total:,} pairs with {len(chunks)} workers "
+              f"({chunk_size:,} pairs each)...")
+        ctx = mp.get_context('fork')   # fork inherits globals — Linux only
+        with ctx.Pool(len(chunks)) as pool:
+            results = pool.map(_worker_extract, chunks)
+        all_rows = [row for chunk in results for row in chunk]
+
+    print(f"  Feature extraction done — {len(all_rows):,} rows")
+    return pd.DataFrame(all_rows)
