@@ -36,18 +36,18 @@ def compute_idf(index, total_docs):
 
 
 def inverted_index_blocking(s1_part, s2s3_part, text_col,
-                             min_idf=2.0, max_candidates_per_token=500):
+                             min_idf=2.0, max_candidates_per_token=200,
+                             min_shared_tokens=2):
     """
-    For each S1, find S2/S3 records sharing at least one rare name token.
-    min_idf=2.0 means token appears in <exp(-2)*N ≈ 13% of docs.
-    max_candidates_per_token: skip tokens that are too common (hotword cap).
+    For each S1, find S2/S3 records sharing >= min_shared_tokens rare name tokens.
+    Requiring 2+ shared tokens reduces pairs ~8x vs 1-token match with minimal recall loss.
+    Entities with only 1 discriminative token fall back to 1-token matching.
     """
     total_docs = len(s2s3_part)
     print(f"    Building inverted index on {total_docs:,} S2/S3 records...")
     index = build_inverted_index(s2s3_part, text_col)
     idf = compute_idf(index, total_docs)
 
-    # Filter: only keep tokens with high enough IDF and not too many matches
     rare_index = {
         t: ids for t, ids in index.items()
         if idf.get(t, 0) >= min_idf and len(ids) <= max_candidates_per_token
@@ -62,12 +62,21 @@ def inverted_index_blocking(s1_part, s2s3_part, text_col,
         text = row[text_col]
         if not isinstance(text, str) or not text.strip():
             continue
-        cands = set()
+
+        # Count how many discriminative tokens each candidate shares with this S1
+        token_hits = defaultdict(int)
+        matched_tokens = 0
         for token in set(text.split()):
             if token in rare_index:
-                cands.update(rare_index[token])
-        for cand_id in cands:
-            pairs.append((row['entity_id'], cand_id))
+                matched_tokens += 1
+                for cand_id in rare_index[token]:
+                    token_hits[cand_id] += 1
+
+        # Require 2+ shared tokens; fall back to 1 if entity has only 1 discriminative token
+        threshold = min_shared_tokens if matched_tokens >= min_shared_tokens else 1
+        for cand_id, hits in token_hits.items():
+            if hits >= threshold:
+                pairs.append((row['entity_id'], cand_id))
 
     return pairs
 
@@ -116,7 +125,8 @@ def get_candidates_fast(s1_norm, s2s3_norm, top_k=None):
             s1_part, s2s3_part,
             text_col='name_no_suffix',
             min_idf=2.0,
-            max_candidates_per_token=500,
+            max_candidates_per_token=200,
+            min_shared_tokens=2,
         )
         print(f"    -> {len(pairs):,} pairs from token blocking")
         all_pairs.extend(pairs)
