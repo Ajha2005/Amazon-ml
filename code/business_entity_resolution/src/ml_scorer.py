@@ -88,8 +88,9 @@ def tune_selection(s1_idx, c_idx, prob, labels, true_count, s1_mask):
 # ── model ─────────────────────────────────────────────────────────────────────
 
 LGB_PARAMS = dict(
-    objective='binary', learning_rate=0.05, num_leaves=255, min_data_in_leaf=200,
-    feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1, lambda_l2=1.0,
+    objective='binary', learning_rate=0.05, num_leaves=255, min_data_in_leaf=300,
+    feature_fraction=0.7, bagging_fraction=0.8, bagging_freq=1,
+    lambda_l1=0.5, lambda_l2=5.0,
     max_bin=511, verbose=-1, seed=42,
 )
 
