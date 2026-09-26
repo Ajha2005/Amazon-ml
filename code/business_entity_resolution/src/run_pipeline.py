@@ -146,11 +146,22 @@ def run_test(k, df_cap):
     n_matched = len(np.unique(s1_idx[sel]))
     print(f"  {len(sel):,} matched pairs; {n_matched:,}/{len(s1_ids):,} S1 records have >=1 match")
 
+    # candidate_pairs.tsv: the shortlist our matcher actually scores as plausible.
+    # We keep pairs above a low probability floor plus all final matches so the file
+    # stays a proper superset of matching_results.tsv but doesn't dump every blocking hit.
+    cand_floor = 0.02
+    cand_mask = prob >= cand_floor
+    cand_mask[sel] = True
+    n_cand = int(cand_mask.sum())
+    print(f"  candidate_pairs: {n_cand:,} pairs kept "
+          f"(prob>={cand_floor} or in matches) — {n_cand / max(len(s1_ids), 1):.1f}/S1 avg")
+
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     _write_grouped(os.path.join(OUTPUT_DIR, 'matching_results.tsv'), 'matched_entity_ids',
                    s1_ids, c_ids, s1_idx[sel], c_idx[sel])
+    cand_rows = np.flatnonzero(cand_mask)
     _write_grouped(os.path.join(OUTPUT_DIR, 'candidate_pairs.tsv'), 'candidate_entity_ids',
-                   s1_ids, c_ids, s1_idx, c_idx)
+                   s1_ids, c_ids, s1_idx[cand_rows], c_idx[cand_rows])
 
 
 if __name__ == '__main__':

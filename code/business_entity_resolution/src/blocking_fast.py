@@ -48,6 +48,25 @@ def _char_ngrams(texts, n=3):
     return out
 
 
+_VOWELS = set('aeiouyh')
+
+
+def _phonetic_word(w):
+    """Consonant-only skeleton, dedupe consecutive dups, keep first 5. Groups
+    similar-sounding words: 'solutions'->'sltns', 'solutionz'->'sltnz' share sltn."""
+    cons = [c for c in w if c.isalpha() and c not in _VOWELS]
+    deduped = []
+    for c in cons:
+        if not deduped or deduped[-1] != c:
+            deduped.append(c)
+    key = ''.join(deduped)[:5]
+    return key or w[:2]
+
+
+def _phonetic(texts):
+    return [' '.join(_phonetic_word(w) for w in s.split() if w) for s in texts]
+
+
 def _fields(df):
     name = _text(df, 'name_no_suffix')
     addr = _text(df, 'addr_expanded')
@@ -59,6 +78,7 @@ def _fields(df):
         'name_bigram': _bigrams(name),
         'addr_bigram': _bigrams(addr),
         'name_char': _char_ngrams(name, 3),
+        'name_phon': _phonetic(name),
         'name_postal': [' '.join(w + '@' + p for w in s.split()) if p else ''
                         for s, p in zip(name, postal)],
     }
