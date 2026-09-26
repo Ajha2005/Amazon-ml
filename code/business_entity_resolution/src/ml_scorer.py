@@ -88,9 +88,9 @@ def tune_selection(s1_idx, c_idx, prob, labels, true_count, s1_mask):
 # ── model ─────────────────────────────────────────────────────────────────────
 
 LGB_PARAMS = dict(
-    objective='binary', learning_rate=0.1, num_leaves=127, min_data_in_leaf=200,
+    objective='binary', learning_rate=0.05, num_leaves=255, min_data_in_leaf=200,
     feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1, lambda_l2=1.0,
-    max_bin=255, verbose=-1, seed=42,
+    max_bin=511, verbose=-1, seed=42,
 )
 
 
@@ -118,8 +118,8 @@ def train_and_tune(cands, labels, true_count, n_s1, model_path, params_path,
     dval = lgb.Dataset(feature_rows(cands, es), labels[es].astype(np.float32),
                        reference=dtrain)
     t = time.time()
-    booster = lgb.train(LGB_PARAMS, dtrain, num_boost_round=1000, valid_sets=[dval],
-                        callbacks=[lgb.early_stopping(50), lgb.log_evaluation(100)])
+    booster = lgb.train(LGB_PARAMS, dtrain, num_boost_round=3000, valid_sets=[dval],
+                        callbacks=[lgb.early_stopping(80), lgb.log_evaluation(100)])
     print(f"  Trained {booster.best_iteration} rounds in {time.time() - t:.0f}s")
     del dtrain, dval
 

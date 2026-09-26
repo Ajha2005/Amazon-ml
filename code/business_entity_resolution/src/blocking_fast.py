@@ -29,6 +29,25 @@ def _bigrams(texts):
     return [' '.join(a + '_' + b for a, b in zip(t, t[1:])) for t in (s.split() for s in texts)]
 
 
+def _char_ngrams(texts, n=3):
+    """Character n-grams inside word boundaries, so typos that break token overlap
+    still share features (e.g. 'kacom' and 'kakom' share 'kak' or 'kac' but words differ)."""
+    out = []
+    for s in texts:
+        if not s:
+            out.append('')
+            continue
+        grams = []
+        for w in s.split():
+            if len(w) < n:
+                grams.append('#' + w)
+            else:
+                for i in range(len(w) - n + 1):
+                    grams.append(w[i:i + n])
+        out.append(' '.join(grams))
+    return out
+
+
 def _fields(df):
     name = _text(df, 'name_no_suffix')
     addr = _text(df, 'addr_expanded')
@@ -39,6 +58,7 @@ def _fields(df):
         'postal': postal,
         'name_bigram': _bigrams(name),
         'addr_bigram': _bigrams(addr),
+        'name_char': _char_ngrams(name, 3),
         'name_postal': [' '.join(w + '@' + p for w in s.split()) if p else ''
                         for s, p in zip(name, postal)],
     }

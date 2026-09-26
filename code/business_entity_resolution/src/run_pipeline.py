@@ -156,8 +156,8 @@ def run_test(k, df_cap):
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument('--mode', choices=['train', 'test', 'both'], default='both')
-    ap.add_argument('--k', type=int, default=20, help='candidates kept per S1 record')
-    ap.add_argument('--df-cap', type=int, default=1000,
+    ap.add_argument('--k', type=int, default=50, help='candidates kept per S1 record')
+    ap.add_argument('--df-cap', type=int, default=2000,
                     help='drop blocking tokens found in more S2/S3 records than this')
     args = ap.parse_args()
 
