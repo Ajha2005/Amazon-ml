@@ -39,7 +39,7 @@ FEATURE_COLS = [f for f, _, _ in STRING_FEATURES] + [
     'suffix_eq', 'suffix_both',
     'postal_eq', 'postal_both', 'house_eq', 'house_both', 'addr_both',
     'src',
-    'block_rel', 'block_rank', 'n_cands_s1', 'n_s1_c',
+    'block_rel', 'block_rank', 'block_rel_c', 'block_rank_c', 'n_cands_s1', 'n_s1_c',
     'base_rank_s1', 'base_gap_s1', 'base_rank_c', 'base_gap_c',
 ]
 
@@ -225,6 +225,8 @@ def compute_features(cands, s1_norm, c_norm, workers=None):
     bs = cands['block_score'].to_numpy()
     cands['block_rel'] = (bs / pd.Series(bs).groupby(i1).transform('max').to_numpy()).astype(np.float32)
     cands['block_rank'] = cands['block_rank'].astype(np.float32)
+    cands['block_rel_c'] = (bs / pd.Series(bs).groupby(i2).transform('max').to_numpy()).astype(np.float32)
+    cands['block_rank_c'] = cands['block_rank_c'].astype(np.float32)
     cands['n_cands_s1'] = np.bincount(i1)[i1].astype(np.float32)
     cands['n_s1_c'] = np.bincount(i2)[i2].astype(np.float32)
     base = ((cands['name_tsr'] + cands['name_jw'] + cands['addr_tsr']) / 3).to_numpy()

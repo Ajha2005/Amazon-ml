@@ -115,21 +115,11 @@ def _topk_chunk(bounds):
             s.data[sel].astype(np.float32), rank[keep].astype(np.int16))
 
 
-def _block_partition(s1_part, c_part, k, df_cap, chunk, workers):
-    x1, x2 = _field_matrices(s1_part, c_part)
-    n_c = x2.shape[0]
-    df = np.asarray(x2.sum(axis=0)).ravel()
-    keep_cols = np.flatnonzero((df > 0) & (df <= df_cap))
-    idf = np.log(n_c / df[keep_cols]).astype(np.float32)
-    print(f"    vocab {len(df):,} tokens, kept {len(keep_cols):,} with df <= {df_cap}")
-
-    _G['x1'] = (x1[:, keep_cols] @ sp.diags(idf)).tocsr()
-    _G['bt'] = x2[:, keep_cols].T.tocsr()
-    _G['k'] = k
-    del x1, x2
-
-    n1 = s1_part.shape[0]
-    bounds = [(i, min(i + chunk, n1)) for i in range(0, n1, chunk)]
+def _topk_rows(query, index_t, k, chunk, workers):
+    """Top-k columns of query @ index_t for every row of query."""
+    _G['x1'], _G['bt'], _G['k'] = query, index_t, k
+    n = query.shape[0]
+    bounds = [(i, min(i + chunk, n)) for i in range(0, n, chunk)]
     if workers > 1 and 'fork' in mp.get_all_start_methods():
         with mp.get_context('fork').Pool(workers) as pool:
             parts = pool.map(_topk_chunk, bounds, chunksize=1)
@@ -139,11 +129,46 @@ def _block_partition(s1_part, c_part, k, df_cap, chunk, workers):
     return [np.concatenate(p) for p in zip(*parts)]
 
 
-def get_candidates_topk(s1_norm, s2s3_norm, k=50, df_cap=1000, chunk=4000, workers=None):
+def _block_partition(s1_part, c_part, k, kc, df_cap, chunk, workers):
+    x1, x2 = _field_matrices(s1_part, c_part)
+    n_c = x2.shape[0]
+    df = np.asarray(x2.sum(axis=0)).ravel()
+    keep_cols = np.flatnonzero((df > 0) & (df <= df_cap))
+    idf = sp.diags(np.log(n_c / df[keep_cols]).astype(np.float32))
+    print(f"    vocab {len(df):,} tokens, kept {len(keep_cols):,} with df <= {df_cap}")
+    x1 = x1[:, keep_cols].tocsr()
+    x2 = x2[:, keep_cols].tocsr()
+
+    # S1 -> S2/S3: best k records for each S1 entity
+    s_a, c_a, sc_a, rk_a = _topk_rows((x1 @ idf).tocsr(), x2.T.tocsr(), k, chunk, workers)
+    # S2/S3 -> S1: each S2/S3 record belongs to at most one S1, so its true S1 is
+    # almost always among its best few. This recovers matches of S1 entities whose
+    # own top-k is crowded out by look-alikes (chains, generic names).
+    c_b, s_b, sc_b, rk_b = _topk_rows((x2 @ idf).tocsr(), x1.T.tocsr(), kc, chunk, workers)
+    del x1, x2
+
+    ka = s_a.astype(np.int64) * n_c + c_a
+    kb = s_b.astype(np.int64) * n_c + c_b
+    keys, inv = np.unique(np.concatenate([ka, kb]), return_inverse=True)
+    ia, ib = inv[:len(ka)], inv[len(ka):]
+    score = np.zeros(len(keys), np.float32)
+    score[ia], score[ib] = sc_a, sc_b
+    rank_s1 = np.full(len(keys), k, np.int16)
+    rank_s1[ia] = rk_a
+    rank_c = np.full(len(keys), kc, np.int16)
+    rank_c[ib] = rk_b
+    print(f"    S1-side {len(ka):,} + S2/S3-side {len(kb):,} -> {len(keys):,} unique pairs")
+    return ((keys // n_c).astype(np.int32), (keys % n_c).astype(np.int32),
+            score, rank_s1, rank_c)
+
+
+def get_candidates_topk(s1_norm, s2s3_norm, k=50, kc=5, df_cap=1000, chunk=4000, workers=None):
     """
-    Returns DataFrame(s1_idx, c_idx, block_score, block_rank) where the indices
-    are row positions in s1_norm / s2s3_norm and block_rank is 0 for the best
-    candidate of each S1 record.
+    Returns DataFrame(s1_idx, c_idx, block_score, block_rank, block_rank_c): the
+    union of each S1 record's top-k S2/S3 records and each S2/S3 record's top-kc
+    S1 records. Indices are row positions in s1_norm / s2s3_norm; block_rank is the
+    pair's rank among the S1's candidates (k if only found from the S2/S3 side),
+    block_rank_c its rank among the S2/S3 record's candidates (kc if not found there).
     """
     workers = workers or min(4, mp.cpu_count())
     s1_country = s1_norm['country'].fillna('').to_numpy(dtype=object)
@@ -160,13 +185,14 @@ def get_candidates_topk(s1_norm, s2s3_norm, k=50, df_cap=1000, chunk=4000, worke
             continue
         t = time.time()
         print(f"  [{country}] S1={len(s1_pos):,}  S2/S3={len(c_pos):,}")
-        r, c, score, rank = _block_partition(
-            s1_norm.iloc[s1_pos], s2s3_norm.iloc[c_pos], k, df_cap, chunk, workers)
+        r, c, score, rank, rank_c = _block_partition(
+            s1_norm.iloc[s1_pos], s2s3_norm.iloc[c_pos], k, kc, df_cap, chunk, workers)
         out.append(pd.DataFrame({
             's1_idx': s1_pos[r].astype(np.int32),
             'c_idx': c_pos[c].astype(np.int32),
             'block_score': score,
             'block_rank': rank,
+            'block_rank_c': rank_c,
         }))
         print(f"    -> {len(r):,} pairs in {time.time() - t:.0f}s")
 
