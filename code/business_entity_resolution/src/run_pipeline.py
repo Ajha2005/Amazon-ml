@@ -73,7 +73,7 @@ def load_normalized(mode):
                          np.ones(len(frames['source3']), np.int8)]
         print(f"  Normalized in {time.time() - t:.0f}s")
         return s1, c
-    return _cached(os.path.join(CACHE_DIR, f'{mode}_norm.pkl'), build)
+    return _cached(os.path.join(CACHE_DIR, f'{mode}_norm_n3.pkl'), build)
 
 
 def build_pairs(mode, k, kc, df_cap):
@@ -82,11 +82,11 @@ def build_pairs(mode, k, kc, df_cap):
     print(f"  S1={len(s1):,}  S2+S3={len(c):,}")
 
     print(f"\n[2/4] Blocking (top-{k} per S1 + top-{kc} per S2/S3, df_cap={df_cap})...")
-    cands = _cached(os.path.join(CACHE_DIR, f'{mode}_cands_bi_k{k}_kc{kc}_cap{df_cap}.pkl'),
+    cands = _cached(os.path.join(CACHE_DIR, f'{mode}_cands_n3_k{k}_kc{kc}_cap{df_cap}.pkl'),
                     lambda: get_candidates_topk(s1, c, k=k, kc=kc, df_cap=df_cap))
 
     print(f"\n[3/4] Features...")
-    feats = _cached(os.path.join(CACHE_DIR, f'{mode}_feats_v5_k{k}_kc{kc}_cap{df_cap}_{BACKEND}.pkl'),
+    feats = _cached(os.path.join(CACHE_DIR, f'{mode}_feats_n3v5_k{k}_kc{kc}_cap{df_cap}_{BACKEND}.pkl'),
                     lambda: compute_features(cands.copy(), s1, c))
     del cands
     s1_ids = s1['entity_id'].to_numpy(dtype=object)
