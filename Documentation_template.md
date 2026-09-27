@@ -12,10 +12,10 @@ pandas, NumPy, SciPy, scikit-learn: BSD).
 |---|---|---|---|---|
 | Baseline | Top-20 Source 2/3 records per Source 1 entity, 37 features | 0.9034 | 0.919 | 0.893 |
 | v3 | Two-way blocking; TF-IDF, address-number and coherence features; normalization of spelling variants | 0.9409 | 0.9436 | 0.924 |
-| v4 | Learned candidate filter; competition features over the full blocked set; wider reverse blocking | TODO | ~0.942 | 0.927 |
-| v5 (final) | Normalization of French address and name variants | TODO | TODO | 0.932 |
+| v4 | Learned candidate filter; competition features over the full blocked set; wider reverse blocking | not recorded | ~0.942 | 0.927 |
+| v5 (final) | Normalization of French address and name variants | 0.9490 (0.9446 after filter) | 0.9511 | 0.932 |
 
-Final candidate set: **TODO candidates per Source 1 entity** in `candidate_pairs.tsv`,
+Final candidate set: **5.3 candidates per Source 1 entity** on the test set in `candidate_pairs.tsv`,
 which is exactly the set the matcher scores.
 
 ## 2. Data observations that shaped the design
@@ -79,7 +79,9 @@ true Source 1 entity is almost always among its best few, even when that entity
 is crowded out of its own top-k by look-alikes (chains, generic names, many
 businesses on one street). On training data (v3, reverse top-3), reverse top-1
 alone reached 0.908 recall versus 0.888 for forward top-10, and the union reached
-0.9409, against 0.9034 for forward top-20 alone.
+0.9409, against 0.9034 for forward top-20 alone. In the final configuration
+(forward top-10, reverse top-5), reverse top-5 alone reaches 0.9473, forward
+top-10 alone 0.8898, and the union 0.9490 with 25.9 pairs per Source 1 entity.
 
 ### 4.2 Learned candidate filter (`features.py`, `ml_scorer.py`)
 
@@ -92,9 +94,11 @@ score is excluded because its scale depends on how many records a country has.
 
 The filter is trained on 80% of training Source 1 entities. Its threshold is the
 0.5th percentile of true-pair scores on the held-out 20%, so it keeps 99.5% of
-the true pairs that blocking found. Blocked pairs go from TODO to **TODO per
-Source 1 entity** (on 300K-entity synthetic data: 26.2 to 3.7). The filtered set
-is written to `candidate_pairs.tsv` and is exactly what the matcher scores.
+the true pairs that blocking found. On training data it cuts blocked pairs from
+25.9 to **4.4 per Source 1 entity** while recall goes from 0.9490 to 0.9446; on
+the test set it cuts them from 30.8 to **5.3 per Source 1 entity** (9.2M pairs).
+For scale, training data has 3.46 true matches per Source 1 entity. The filtered
+set is written to `candidate_pairs.tsv` and is exactly what the matcher scores.
 
 ## 5. Matcher (`features.py`, `ml_scorer.py`)
 
@@ -130,8 +134,9 @@ A pair is predicted as a match when its probability is at least a threshold t.
 Each Source 2/3 record is then assigned only to the Source 1 entity with the
 highest probability, because it can belong to at most one. The threshold
 (grid 0.10–0.95), an optional relative-to-best rule and the assignment step are
-tuned together to maximize macro F0.5 on held-out Source 1 entities; the chosen
-threshold is around 0.8, reflecting F0.5's weight on precision.
+tuned together to maximize macro F0.5 on held-out Source 1 entities. The final
+model's chosen threshold is 0.625 with the assignment step on; before the
+candidate filter, when the matcher also saw every easy negative, it was about 0.8.
 
 ## 6. Validation protocol
 
@@ -151,12 +156,15 @@ countries: no country-specific parameters, relative instead of absolute
 blocking scores, and one set of normalization rules for every record. French
 spelling variants were identified by inspecting unlabeled test records
 (section 2); no test labels exist or were used. The gap between validation
-(US + India) and the leaderboard, most of it attributable to France, shrank from
-2.6 points (baseline) to 2.0 (v3) and TODO (v5).
+(US + India) and the leaderboard, most of it attributable to France, went from
+2.6 points (baseline) to 2.0 (v3) and 1.9 (v5). The final normalization pass raised
+validation (about 0.942 to 0.951) and the leaderboard (0.927 to 0.932) by similar
+amounts, so it helped every country rather than closing the France gap
+specifically; France remains the main source of the remaining gap.
 
 ## 8. Scale and reproducibility
 
-- Full run on a 4-core, 30GB Kaggle CPU notebook: about 3–3.5 hours for training
+- Full run on a 4-core, 30GB Kaggle CPU notebook: 207 minutes for training
   and test together; estimated peak memory about 25GB.
 - Every stage is cached, so a rerun resumes from the last finished stage.
 - Seeds are fixed for the split, negative sampling and LightGBM.
