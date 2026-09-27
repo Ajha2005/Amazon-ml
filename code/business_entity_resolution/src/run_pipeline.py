@@ -76,17 +76,17 @@ def load_normalized(mode):
     return _cached(os.path.join(CACHE_DIR, f'{mode}_norm.pkl'), build)
 
 
-def build_pairs(mode, k, df_cap):
+def build_pairs(mode, k, kc, df_cap):
     print(f"\n[1/4] Loading + normalizing {mode} data...")
     s1, c = load_normalized(mode)
     print(f"  S1={len(s1):,}  S2+S3={len(c):,}")
 
-    print(f"\n[2/4] Blocking (top-{k} per S1, df_cap={df_cap})...")
-    cands = _cached(os.path.join(CACHE_DIR, f'{mode}_cands_k{k}_cap{df_cap}.pkl'),
-                    lambda: get_candidates_topk(s1, c, k=k, df_cap=df_cap))
+    print(f"\n[2/4] Blocking (top-{k} per S1 + top-{kc} per S2/S3, df_cap={df_cap})...")
+    cands = _cached(os.path.join(CACHE_DIR, f'{mode}_cands_bi_k{k}_kc{kc}_cap{df_cap}.pkl'),
+                    lambda: get_candidates_topk(s1, c, k=k, kc=kc, df_cap=df_cap))
 
     print(f"\n[3/4] Features...")
-    feats = _cached(os.path.join(CACHE_DIR, f'{mode}_feats_k{k}_cap{df_cap}_{BACKEND}.pkl'),
+    feats = _cached(os.path.join(CACHE_DIR, f'{mode}_feats_bi_k{k}_kc{kc}_cap{df_cap}_{BACKEND}.pkl'),
                     lambda: compute_features(cands.copy(), s1, c))
     del cands
     s1_ids = s1['entity_id'].to_numpy(dtype=object)
@@ -96,8 +96,8 @@ def build_pairs(mode, k, df_cap):
     return feats, s1_ids, c_ids
 
 
-def run_train(k, df_cap):
-    feats, s1_ids, c_ids = build_pairs('train', k, df_cap)
+def run_train(k, kc, df_cap):
+    feats, s1_ids, c_ids = build_pairs('train', k, kc, df_cap)
     gt = pd.read_csv(os.path.join(DATA_DIR['train'], 'train_ground_truth.tsv'),
                      sep='\t', dtype=str, na_filter=False)
     true_count, true_keys = ground_truth_index(gt, s1_ids, c_ids)
@@ -122,7 +122,7 @@ def _write_grouped(path, col, s1_ids, c_ids, s1_idx, c_idx):
     print(f"  Wrote {path}")
 
 
-def run_test(k, df_cap):
+def run_test(k, kc, df_cap):
     import lightgbm as lgb
     with open(PARAMS_PATH) as f:
         params = json.load(f)
@@ -134,7 +134,7 @@ def run_test(k, df_cap):
     booster = lgb.Booster(model_file=MODEL_PATH)
     print(f"  Loaded model + params: {params}")
 
-    feats, s1_ids, c_ids = build_pairs('test', k, df_cap)
+    feats, s1_ids, c_ids = build_pairs('test', k, kc, df_cap)
 
     print(f"\n[4/4] Scoring + writing output...")
     prob = predict(booster, feats)
@@ -167,7 +167,8 @@ def run_test(k, df_cap):
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument('--mode', choices=['train', 'test', 'both'], default='both')
-    ap.add_argument('--k', type=int, default=50, help='candidates kept per S1 record')
+    ap.add_argument('--k', type=int, default=10, help='candidates kept per S1 record')
+    ap.add_argument('--kc', type=int, default=3, help='S1 candidates kept per S2/S3 record')
     ap.add_argument('--df-cap', type=int, default=2000,
                     help='drop blocking tokens found in more S2/S3 records than this')
     args = ap.parse_args()
@@ -175,8 +176,8 @@ if __name__ == '__main__':
     os.makedirs(CACHE_DIR, exist_ok=True)
     start = time.time()
     if args.mode in ('train', 'both'):
-        run_train(args.k, args.df_cap)
+        run_train(args.k, args.kc, args.df_cap)
         gc.collect()
     if args.mode in ('test', 'both'):
-        run_test(args.k, args.df_cap)
+        run_test(args.k, args.kc, args.df_cap)
     print(f"\nTotal time: {(time.time() - start) / 60:.1f} min")

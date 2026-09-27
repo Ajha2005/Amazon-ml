@@ -34,15 +34,18 @@ def pair_labels(cands, true_keys, n_c):
 
 
 def blocking_report(cands, labels, true_count):
-    total = int(true_count.sum())
-    rank = cands['block_rank'].to_numpy()
+    total = max(int(true_count.sum()), 1)
     print(f"  Ground-truth pairs: {total:,}")
-    for k in (1, 3, 5, 10, 15, 20, 30, 50):
-        if k > rank.max() + 1:
-            break
-        hit = int(labels[rank < k].sum())
-        n = int((rank < k).sum())
-        print(f"    recall@{k:<3} = {hit / max(total, 1):.4f}   ({n:,} pairs)")
+    print(f"  RECALL OF ALL {len(cands):,} CANDIDATE PAIRS = {labels.sum() / total:.4f}")
+    for col, side in (('block_rank', 'S1-side'), ('block_rank_c', 'S2/S3-side')):
+        if col not in cands:
+            continue
+        rank = cands[col].to_numpy()
+        for k in (1, 2, 3, 5, 10, 15, 20, 30, 50):
+            if k > rank.max():
+                break
+            m = rank < k
+            print(f"    {side} recall@{k:<3} = {labels[m].sum() / total:.4f}   ({int(m.sum()):,} pairs)")
 
 
 # ── selection + metric ───────────────────────────────────────────────────────
@@ -88,7 +91,7 @@ def tune_selection(s1_idx, c_idx, prob, labels, true_count, s1_mask):
 # ── model ─────────────────────────────────────────────────────────────────────
 
 LGB_PARAMS = dict(
-    objective='binary', learning_rate=0.05, num_leaves=255, min_data_in_leaf=300,
+    objective='binary', learning_rate=0.08, num_leaves=255, min_data_in_leaf=300,
     feature_fraction=0.7, bagging_fraction=0.8, bagging_freq=1,
     lambda_l1=0.5, lambda_l2=5.0,
     max_bin=511, verbose=-1, seed=42,
@@ -119,8 +122,8 @@ def train_and_tune(cands, labels, true_count, n_s1, model_path, params_path,
     dval = lgb.Dataset(feature_rows(cands, es), labels[es].astype(np.float32),
                        reference=dtrain)
     t = time.time()
-    booster = lgb.train(LGB_PARAMS, dtrain, num_boost_round=3000, valid_sets=[dval],
-                        callbacks=[lgb.early_stopping(80), lgb.log_evaluation(100)])
+    booster = lgb.train(LGB_PARAMS, dtrain, num_boost_round=2000, valid_sets=[dval],
+                        callbacks=[lgb.early_stopping(60), lgb.log_evaluation(100)])
     print(f"  Trained {booster.best_iteration} rounds in {time.time() - t:.0f}s")
     del dtrain, dval
 
