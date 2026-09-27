@@ -2,10 +2,14 @@
 """
 End-to-end entity resolution pipeline.
 
-  train: normalize -> top-K blocking -> features -> LightGBM (S1-level holdout)
-         -> tune threshold on holdout -> save model + selection params
-  test:  normalize -> top-K blocking -> features -> load model -> select matches
-         -> output/matching_results.tsv + output/candidate_pairs.tsv
+  1. normalize names and addresses
+  2. token blocking: top-k S2/S3 records per S1 + top-kc S1 records per S2/S3
+  3. candidate filter: a small LightGBM on cheap features drops clearly wrong pairs
+  4. full features for the filtered pairs only
+  5. LightGBM matcher (S1-level holdout, tuned selection) -> matching_results.tsv
+
+candidate_pairs.tsv is exactly the filtered set from step 3, i.e. every pair the
+matcher scores.
 
 Every stage is cached under cache/ so reruns skip finished work.
 """
@@ -22,9 +26,10 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from normalize_fast import normalize_in_chunks_fast
 from blocking_fast import get_candidates_topk
-from features import compute_features, BACKEND, FEATURE_COLS
+from features import (compute_features, prefilter_features, BACKEND, FEATURE_COLS,
+                      PREFILTER_COLS, CARRIED_COLS)
 from ml_scorer import (ground_truth_index, pair_labels, blocking_report,
-                       train_and_tune, predict, select_matches)
+                       train_and_tune, train_prefilter, predict, select_matches)
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..'))
 DATA_DIR = {'train': os.path.join(BASE_DIR, 'dataset', 'train'),
@@ -33,6 +38,8 @@ OUTPUT_DIR = os.path.join(BASE_DIR, 'output')
 CACHE_DIR = os.path.join(BASE_DIR, 'cache')
 MODEL_PATH = os.path.join(OUTPUT_DIR, 'model.txt')
 PARAMS_PATH = os.path.join(OUTPUT_DIR, 'selection_params.json')
+FILTER_MODEL_PATH = os.path.join(OUTPUT_DIR, 'filter_model.txt')
+FILTER_PARAMS_PATH = os.path.join(OUTPUT_DIR, 'filter_params.json')
 
 NEEDED_COLS = ['entity_id', 'business_name', 'business_address', 'country']
 KEEP_NORM = ['entity_id', 'name_clean', 'name_no_suffix', 'legal_suffix', 'acronym',
@@ -73,41 +80,67 @@ def load_normalized(mode):
                          np.ones(len(frames['source3']), np.int8)]
         print(f"  Normalized in {time.time() - t:.0f}s")
         return s1, c
-    return _cached(os.path.join(CACHE_DIR, f'{mode}_norm.pkl'), build)
+    return _cached(os.path.join(CACHE_DIR, f'{mode}_norm_n4.pkl'), build)
 
 
-def build_pairs(mode, k, kc, df_cap):
-    print(f"\n[1/4] Loading + normalizing {mode} data...")
+def stage1(mode, k, kc, df_cap):
+    """Normalization, token blocking and the cheap filter features for every blocking pair."""
+    print(f"\n[1/5] Loading + normalizing {mode} data...")
     s1, c = load_normalized(mode)
     print(f"  S1={len(s1):,}  S2+S3={len(c):,}")
 
-    print(f"\n[2/4] Blocking (top-{k} per S1 + top-{kc} per S2/S3, df_cap={df_cap})...")
-    cands = _cached(os.path.join(CACHE_DIR, f'{mode}_cands_bi_k{k}_kc{kc}_cap{df_cap}.pkl'),
+    tag = f'{mode}_n4_k{k}_kc{kc}_cap{df_cap}'
+    print(f"\n[2/5] Blocking (top-{k} per S1 + top-{kc} per S2/S3, df_cap={df_cap})...")
+    cands = _cached(os.path.join(CACHE_DIR, f'{tag}_cands.pkl'),
                     lambda: get_candidates_topk(s1, c, k=k, kc=kc, df_cap=df_cap))
+    print(f"\n[3/5] Candidate filter features...")
+    pf = _cached(os.path.join(CACHE_DIR, f'{tag}_filterfeats2_{BACKEND}.pkl'),
+                 lambda: prefilter_features(cands, s1, c))
+    return s1, c, cands, pf, tag
 
-    print(f"\n[3/4] Features...")
-    feats = _cached(os.path.join(CACHE_DIR, f'{mode}_feats_bi_k{k}_kc{kc}_cap{df_cap}_{BACKEND}.pkl'),
-                    lambda: compute_features(cands.copy(), s1, c))
-    del cands
+
+def stage2(tag, threshold, s1, c, cands, pf, score, keep):
+    """Full features for the pairs the filter kept, plus full-set competition
+    features and the filter score."""
+    kept = cands.loc[keep, ['s1_idx', 'c_idx', 'block_score', 'block_rank', 'block_rank_c']]
+    kept = kept.reset_index(drop=True)
+    print(f"\n[4/5] Full features for the {len(kept):,} filtered candidates...")
+
+    def build():
+        feats = compute_features(kept, s1, c)
+        for src, dst in CARRIED_COLS.items():
+            feats[dst] = pf[src].to_numpy()[keep]
+        feats['filter_score'] = score[keep]
+        return feats
+    return _cached(os.path.join(CACHE_DIR, f'{tag}_f{threshold:.6f}_feats_v7_{BACKEND}.pkl'), build)
+
+
+def run_train(k, kc, df_cap, filter_recall):
+    s1, c, cands, pf, tag = stage1('train', k, kc, df_cap)
     s1_ids = s1['entity_id'].to_numpy(dtype=object)
     c_ids = c['entity_id'].to_numpy(dtype=object)
-    del s1, c
-    gc.collect()
-    return feats, s1_ids, c_ids
-
-
-def run_train(k, kc, df_cap):
-    feats, s1_ids, c_ids = build_pairs('train', k, kc, df_cap)
     gt = pd.read_csv(os.path.join(DATA_DIR['train'], 'train_ground_truth.tsv'),
                      sep='\t', dtype=str, na_filter=False)
     true_count, true_keys = ground_truth_index(gt, s1_ids, c_ids)
-    labels = pair_labels(feats, true_keys, len(c_ids))
+    labels_all = pair_labels(cands, true_keys, len(c_ids))
     del gt, true_keys
     print(f"  S1 with no true match (singletons): {(true_count == 0).mean():.2%}")
-    blocking_report(feats, labels, true_count)
+    blocking_report(cands, labels_all, true_count)
 
-    print(f"\n[4/4] Training LightGBM...")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    print(f"\n  Training candidate filter (target: keep {filter_recall:.1%} of true pairs)...")
+    score, threshold = train_prefilter(pf, PREFILTER_COLS, cands['s1_idx'].to_numpy(), labels_all,
+                                       len(s1_ids), true_count, filter_recall, FILTER_MODEL_PATH)
+    with open(FILTER_PARAMS_PATH, 'w') as f:
+        json.dump({'threshold': threshold, 'target_recall': filter_recall,
+                   'features': PREFILTER_COLS, 'k': k, 'kc': kc, 'df_cap': df_cap}, f, indent=2)
+    keep = score >= threshold
+    feats = stage2(tag, threshold, s1, c, cands, pf, score, keep)
+    labels = labels_all[keep]
+    del s1, c, cands, pf, score, labels_all
+    gc.collect()
+
+    print(f"\n[5/5] Training LightGBM matcher...")
     train_and_tune(feats, labels, true_count, len(s1_ids), MODEL_PATH, PARAMS_PATH,
                    backend=BACKEND)
 
@@ -126,17 +159,32 @@ def run_test(k, kc, df_cap):
     import lightgbm as lgb
     with open(PARAMS_PATH) as f:
         params = json.load(f)
+    with open(FILTER_PARAMS_PATH) as f:
+        fparams = json.load(f)
     if params.get('backend') != BACKEND:
         print(f"  WARNING: model trained with {params.get('backend')} features, "
               f"now using {BACKEND} — scores may be off")
-    if params.get('features') != FEATURE_COLS:
+    if params.get('features') != FEATURE_COLS or fparams.get('features') != PREFILTER_COLS:
         sys.exit("Feature list changed since training — retrain with --mode train")
+    if (fparams['k'], fparams['kc'], fparams['df_cap']) != (k, kc, df_cap):
+        sys.exit(f"Blocking settings differ from training {fparams} — use the same --k/--kc/--df-cap")
     booster = lgb.Booster(model_file=MODEL_PATH)
-    print(f"  Loaded model + params: {params}")
+    filter_booster = lgb.Booster(model_file=FILTER_MODEL_PATH)
+    print(f"  Loaded matcher params: { {x: params[x] for x in ('threshold', 'rel', 'resolve', 'val_f05')} }")
+    print(f"  Loaded filter threshold: {fparams['threshold']:.6f}")
 
-    feats, s1_ids, c_ids = build_pairs('test', k, kc, df_cap)
+    s1, c, cands, pf, tag = stage1('test', k, kc, df_cap)
+    s1_ids = s1['entity_id'].to_numpy(dtype=object)
+    c_ids = c['entity_id'].to_numpy(dtype=object)
+    score = predict(filter_booster, pf, cols=PREFILTER_COLS)
+    keep = score >= fparams['threshold']
+    print(f"  Filter: {len(cands):,} -> {int(keep.sum()):,} pairs "
+          f"({len(cands) / len(s1_ids):.1f} -> {keep.sum() / len(s1_ids):.1f} per S1)")
+    feats = stage2(tag, fparams['threshold'], s1, c, cands, pf, score, keep)
+    del s1, c, cands, pf, score
+    gc.collect()
 
-    print(f"\n[4/4] Scoring + writing output...")
+    print(f"\n[5/5] Scoring + writing output...")
     prob = predict(booster, feats)
     s1_idx = feats['s1_idx'].to_numpy()
     c_idx = feats['c_idx'].to_numpy()
@@ -145,38 +193,31 @@ def run_test(k, kc, df_cap):
                          s1_max, params['resolve'])
     n_matched = len(np.unique(s1_idx[sel]))
     print(f"  {len(sel):,} matched pairs; {n_matched:,}/{len(s1_ids):,} S1 records have >=1 match")
-
-    # candidate_pairs.tsv: the shortlist our matcher actually scores as plausible.
-    # We keep pairs above a low probability floor plus all final matches so the file
-    # stays a proper superset of matching_results.tsv but doesn't dump every blocking hit.
-    cand_floor = 0.02
-    cand_mask = prob >= cand_floor
-    cand_mask[sel] = True
-    n_cand = int(cand_mask.sum())
-    print(f"  candidate_pairs: {n_cand:,} pairs kept "
-          f"(prob>={cand_floor} or in matches) — {n_cand / max(len(s1_ids), 1):.1f}/S1 avg")
+    print(f"  candidate_pairs: {len(feats):,} pairs = exactly the set the matcher scored "
+          f"({len(feats) / len(s1_ids):.1f} per S1)")
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     _write_grouped(os.path.join(OUTPUT_DIR, 'matching_results.tsv'), 'matched_entity_ids',
                    s1_ids, c_ids, s1_idx[sel], c_idx[sel])
-    cand_rows = np.flatnonzero(cand_mask)
     _write_grouped(os.path.join(OUTPUT_DIR, 'candidate_pairs.tsv'), 'candidate_entity_ids',
-                   s1_ids, c_ids, s1_idx[cand_rows], c_idx[cand_rows])
+                   s1_ids, c_ids, s1_idx, c_idx)
 
 
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument('--mode', choices=['train', 'test', 'both'], default='both')
     ap.add_argument('--k', type=int, default=10, help='candidates kept per S1 record')
-    ap.add_argument('--kc', type=int, default=3, help='S1 candidates kept per S2/S3 record')
+    ap.add_argument('--kc', type=int, default=5, help='S1 candidates kept per S2/S3 record')
     ap.add_argument('--df-cap', type=int, default=2000,
                     help='drop blocking tokens found in more S2/S3 records than this')
+    ap.add_argument('--filter-recall', type=float, default=0.995,
+                    help='share of blocking\'s true pairs the candidate filter must keep')
     args = ap.parse_args()
 
     os.makedirs(CACHE_DIR, exist_ok=True)
     start = time.time()
     if args.mode in ('train', 'both'):
-        run_train(args.k, args.kc, args.df_cap)
+        run_train(args.k, args.kc, args.df_cap, args.filter_recall)
         gc.collect()
     if args.mode in ('test', 'both'):
         run_test(args.k, args.kc, args.df_cap)
