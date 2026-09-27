@@ -80,7 +80,7 @@ def load_normalized(mode):
                          np.ones(len(frames['source3']), np.int8)]
         print(f"  Normalized in {time.time() - t:.0f}s")
         return s1, c
-    return _cached(os.path.join(CACHE_DIR, f'{mode}_norm_n3.pkl'), build)
+    return _cached(os.path.join(CACHE_DIR, f'{mode}_norm_n4.pkl'), build)
 
 
 def stage1(mode, k, kc, df_cap):
@@ -89,7 +89,7 @@ def stage1(mode, k, kc, df_cap):
     s1, c = load_normalized(mode)
     print(f"  S1={len(s1):,}  S2+S3={len(c):,}")
 
-    tag = f'{mode}_n3_k{k}_kc{kc}_cap{df_cap}'
+    tag = f'{mode}_n4_k{k}_kc{kc}_cap{df_cap}'
     print(f"\n[2/5] Blocking (top-{k} per S1 + top-{kc} per S2/S3, df_cap={df_cap})...")
     cands = _cached(os.path.join(CACHE_DIR, f'{tag}_cands.pkl'),
                     lambda: get_candidates_topk(s1, c, k=k, kc=kc, df_cap=df_cap))

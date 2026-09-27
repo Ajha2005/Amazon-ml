@@ -38,12 +38,19 @@ _PREFIX_PATTERN = re.compile(r'^(' + '|'.join(re.escape(s) for s in LEGAL_PREFIX
 _MULTI_SPACE = re.compile(r'\s+')
 _PUNCT = re.compile(r'[^\w\s]')
 _COMBINING = re.compile(r'[̀-ͯ]')
-_ELISION = re.compile(r"\b[ld]['’]")
+_APOSTROPHE = re.compile(r"['’`]")
 _DOTTED = re.compile(r'\b(?:[a-z]\.\s?){2,}(?:[a-z]\b)?')
 _POSTAL_RE = re.compile(r'\b(\d{5,6})\b')
 _HOUSE_RE = re.compile(r'^(\d+[\-/]?\d*)\s')
 _DIGIT_ALPHA = re.compile(r'(\d)(?!(?:st|nd|rd|th)\b)([a-z])')
 _ALPHA_DIGIT = re.compile(r'([a-z])(\d)')
+_NUMERO = re.compile(r'\bn\s*\u00b0')
+_NO_BEFORE_DIGIT = re.compile(r'\bno\s+(?=\d)')
+_LEADING_ZEROS = re.compile(r'\b0+(?=\d)')
+_COUNTRY_IN_NAME = re.compile(r'\(\s*(?:france|india|usa)\s*\)')
+_TRAILING_COUNTRY = re.compile(r'\s(?:france|india|usa)$')
+_TRADE_NAME = re.compile(r'^.*?\b(?:trading as|doing business as|dba|aka|t a)\s+(?=\S)')
+_INNER_FORMS = re.compile(r'\b(?:sarl|sasu|sas|eurl|sci|snc|selarl|scop|gmbh)\b')
 _CEDEX = re.compile(r'\bcedex(?:\s+\d{1,3})?\b')
 _LIGATURES = str.maketrans({'œ': 'oe', 'æ': 'ae', 'ß': 'ss', 'ø': 'o'})
 
@@ -86,6 +93,43 @@ ADDR_WORDS = {
 }
 
 
+# Whole comma-separated address components that are only a region, state or
+# country: sources include or swap them inconsistently ("..., Hauts-de-France"
+# vs "..., Nord" vs nothing). Names that double as cities are left out.
+REGIONS = [
+    'hauts de france', 'nouvelle aquitaine', 'pays de la loire', 'ile de france', 'grand est',
+    'auvergne rhone alpes', 'provence alpes cote dazur', 'occitanie', 'bretagne', 'normandie',
+    'bourgogne franche comte', 'centre val de loire', 'corse',
+    'nord', 'pas de calais', 'gironde', 'loire atlantique', 'somme', 'aisne', 'oise', 'vendee',
+    'maine et loire', 'sarthe', 'mayenne', 'landes', 'dordogne', 'charente', 'charente maritime',
+    'pyrenees atlantiques', 'lot et garonne',
+    'andhra pradesh', 'arunachal pradesh', 'assam', 'bihar', 'chhattisgarh', 'goa', 'gujarat',
+    'haryana', 'himachal pradesh', 'jharkhand', 'karnataka', 'kerala', 'madhya pradesh',
+    'maharashtra', 'manipur', 'meghalaya', 'mizoram', 'nagaland', 'odisha', 'orissa', 'punjab',
+    'rajasthan', 'sikkim', 'tamil nadu', 'telangana', 'tripura', 'uttar pradesh', 'uttarakhand',
+    'west bengal', 'jammu and kashmir', 'nct of delhi',
+    'alabama', 'alaska', 'arizona', 'arkansas', 'california', 'colorado', 'connecticut', 'delaware',
+    'florida', 'georgia', 'hawaii', 'idaho', 'illinois', 'indiana', 'iowa', 'kansas', 'kentucky',
+    'louisiana', 'maine', 'maryland', 'massachusetts', 'michigan', 'minnesota', 'mississippi',
+    'missouri', 'montana', 'nebraska', 'nevada', 'new hampshire', 'new jersey', 'new mexico',
+    'north carolina', 'north dakota', 'ohio', 'oklahoma', 'oregon', 'pennsylvania', 'rhode island',
+    'south carolina', 'south dakota', 'tennessee', 'texas', 'utah', 'vermont', 'virginia',
+    'west virginia', 'wisconsin', 'wyoming', 'district of columbia',
+    'france', 'india', 'usa', 'us', 'united states', 'united states of america',
+]
+_REGION_RE = re.compile(
+    r'(?:^|(?<=,))\s*(?:' + '|'.join(r'[\s\-]+'.join(map(re.escape, r.split())) for r in
+                                  sorted(REGIONS, key=len, reverse=True)) + r')\s*(\d{5,6})?\s*(?=,|$)')
+
+STREET_TYPES = ['rue', 'avenue', 'boulevard', 'allee', 'cours', 'place', 'chemin', 'impasse', 'route',
+                'quai', 'square', 'cite', 'residence', 'faubourg', 'passage', 'promenade', 'street',
+                'road', 'lane', 'drive', 'court', 'highway', 'parkway', 'circle', 'trail', 'plaza',
+                'way', 'marg', 'nagar']
+# House number anywhere in the address when it is not the first token
+# ("hauts de france 37 rue chanzy lille", "dunkerque 29 cours francois bart")
+_HOUSE_BEFORE_STREET = re.compile(r'\b(\d+)\s+(?:(?:bis|ter|[a-z])\s+)?(?:' + '|'.join(STREET_TYPES) + r')\b')
+
+
 def _word_pattern(words):
     return re.compile(r'\b(' + '|'.join(re.escape(w) for w in sorted(words, key=len, reverse=True)) + r')\b')
 
@@ -95,10 +139,13 @@ _NAME_RE = _word_pattern(NAME_WORDS)
 _ADDR_RE = _word_pattern(ADDR_WORDS)
 
 
-def _base_clean(series: pd.Series) -> pd.Series:
+def _pre_clean(series: pd.Series) -> pd.Series:
     s = series.fillna('').str.lower().str.translate(_LIGATURES)
     s = s.str.normalize('NFKD').str.replace(_COMBINING, '', regex=True)
-    s = s.str.replace(_ELISION, '', regex=True)
+    return s.str.replace(_APOSTROPHE, '', regex=True)
+
+
+def _post_clean(s: pd.Series) -> pd.Series:
     s = s.str.replace(_DOTTED, lambda m: m.group(0).replace('.', '').replace(' ', '') + ' ', regex=True)
     s = s.str.replace('&', ' and ', regex=False)
     s = s.str.replace(_PUNCT, ' ', regex=True)
@@ -111,13 +158,15 @@ def _squash(s: pd.Series) -> pd.Series:
 
 def normalize_names(series: pd.Series) -> pd.DataFrame:
     """Returns DataFrame with name_clean, name_no_suffix, legal_suffix, acronym."""
-    s = _base_clean(series)
+    s = _pre_clean(series).str.replace(_COUNTRY_IN_NAME, ' ', regex=True)
+    s = _post_clean(s).str.replace(_TRAILING_COUNTRY, '', regex=True)
     s = s.str.replace(_SPACED_RE, lambda m: SPACED_FORMS[m.group(1)], regex=True)
     s = s.str.replace(_NAME_RE, lambda m: NAME_WORDS[m.group(1)], regex=True)
     name_clean = s
 
     legal_suffix = s.str.extract(_SUFFIX_PATTERN, expand=False).fillna('')
-    name_no_suffix = s
+    # "X trading as Y" / "X dba Y": keep the trade name Y
+    name_no_suffix = s.str.replace(_TRADE_NAME, '', regex=True)
     for _ in range(3):
         name_no_suffix = name_no_suffix.str.replace(_STRIP_SUFFIX, '', regex=True)
 
@@ -125,6 +174,9 @@ def normalize_names(series: pd.Series) -> pd.DataFrame:
     has_prefix = prefix != ''
     name_no_suffix = name_no_suffix.where(~has_prefix, name_no_suffix.str.replace(_PREFIX_PATTERN, '', regex=True))
     legal_suffix = legal_suffix.where(legal_suffix != '', prefix)
+    # Legal forms left in the middle ("as sarl sportive", "team sarl and fils")
+    inner = _squash(name_no_suffix.str.replace(_INNER_FORMS, ' ', regex=True))
+    name_no_suffix = inner.where(inner != '', name_no_suffix)
 
     acronym = name_no_suffix.str.split().map(
         lambda tokens: ''.join(t[0] for t in tokens if t) if isinstance(tokens, list) and len(tokens) >= 2 else ''
@@ -139,15 +191,22 @@ def normalize_names(series: pd.Series) -> pd.DataFrame:
 
 def normalize_addresses(series: pd.Series) -> pd.DataFrame:
     """Returns DataFrame with addr_clean, addr_expanded, postal_code, house_number."""
-    s = _base_clean(series)
+    s = _pre_clean(series).str.replace(_NUMERO, 'no ', regex=True)
+    s = _post_clean(s.str.replace(_REGION_RE, r' \1', regex=True))
     s = s.str.replace(_DIGIT_ALPHA, r'\1 \2', regex=True).str.replace(_ALPHA_DIGIT, r'\1 \2', regex=True)
     s = _squash(s.str.replace(_CEDEX, ' ', regex=True))
     addr_clean = s
 
     postal_code = s.str.extract(_POSTAL_RE, expand=False).fillna('')
-    addr_no_postal = s.str.replace(_POSTAL_RE, '', regex=True).str.strip()
+    addr_no_postal = s.str.replace(_POSTAL_RE, '', regex=True)
+    addr_no_postal = _squash(addr_no_postal.str.replace(_NO_BEFORE_DIGIT, '', regex=True)
+                             .str.replace(_LEADING_ZEROS, '', regex=True))
     house_number = addr_no_postal.str.extract(_HOUSE_RE, expand=False).fillna('')
     addr_expanded = _squash(addr_no_postal.str.replace(_ADDR_RE, lambda m: ADDR_WORDS[m.group(1)], regex=True))
+    missing = house_number == ''
+    if missing.any():
+        house_number = house_number.copy()
+        house_number[missing] = addr_expanded[missing].str.extract(_HOUSE_BEFORE_STREET, expand=False).fillna('')
 
     return pd.DataFrame({
         'addr_clean': addr_clean,
