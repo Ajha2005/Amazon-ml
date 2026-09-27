@@ -13,7 +13,7 @@ pandas, NumPy, SciPy, scikit-learn: BSD).
 | Baseline | Top-20 Source 2/3 records per Source 1 entity, 37 features | 0.9034 | 0.919 | 0.893 |
 | v3 | Two-way blocking; TF-IDF, address-number and coherence features; normalization of spelling variants | 0.9409 | 0.9436 | 0.924 |
 | v4 | Learned candidate filter; competition features over the full blocked set; wider reverse blocking | TODO | ~0.942 | 0.927 |
-| v5 (final) | Normalization of French address and name variants | TODO | TODO | TODO |
+| v5 (final) | Normalization of French address and name variants | TODO | TODO | 0.932 |
 
 Final candidate set: **TODO candidates per Source 1 entity** in `candidate_pairs.tsv`,
 which is exactly the set the matcher scores.
