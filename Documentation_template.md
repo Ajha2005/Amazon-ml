@@ -1,7 +1,7 @@
 # ML Challenge 2026: Business Entity Resolution Solution Template
 
-**Team Name:** TODO  
-**Team Members:** TODO  
+**Team Name:** Codess  
+**Team Members:** Abhavya Jha, Khushi Chhabra  
 **Submission Date:** 27 September 2026
 
 ---
