@@ -33,7 +33,7 @@ STRING_FEATURES = [
     ('addr_jw', 'addr_expanded', 'jw'),
 ]
 
-FEATURE_COLS = [f for f, _, _ in STRING_FEATURES] + [
+BASE_FEATURE_COLS = [f for f, _, _ in STRING_FEATURES] + [
     'name_exact', 'first_tok_eq', 'last_tok_eq',
     'name_len1', 'name_len2', 'name_len_ratio', 'ntok1', 'ntok2',
     'acr_s1_eq_name', 'acr_c_eq_name', 'acr_eq',
@@ -257,6 +257,63 @@ def _add_coherence_features(cands, c_norm, i1, i2, base, workers):
     ref_base = np.full(n, -1.0, np.float32)
     ref_base[rows] = base[ref[has]]
     cands['coh_ref_base'] = ref_base
+
+
+PREFILTER_COLS = [
+    'block_rank', 'block_rank_c', 'block_rel', 'block_rel_c', 'n_cands_s1', 'n_s1_c',
+    'pf_name_tsr', 'pf_name_jw', 'pf_addr_tsr', 'pf_postal_eq', 'pf_postal_both',
+    'pf_house_eq', 'pf_house_both', 'src',
+    'pf_rank_s1', 'pf_gap_s1', 'pf_rank_c', 'pf_gap_c',
+]
+
+# Competition features computed over the full blocking set are handed to the
+# matcher: after filtering, most rival candidates are gone, so the same features
+# recomputed on the filtered set alone make wrong pairs look uncontested.
+CARRIED_COLS = {
+    'pf_rank_s1': 'all_rank_s1', 'pf_gap_s1': 'all_gap_s1',
+    'pf_rank_c': 'all_rank_c', 'pf_gap_c': 'all_gap_c',
+    'n_cands_s1': 'all_n_cands_s1', 'n_s1_c': 'all_n_s1_c',
+    'block_rel': 'all_block_rel', 'block_rel_c': 'all_block_rel_c',
+}
+FEATURE_COLS = BASE_FEATURE_COLS + list(CARRIED_COLS.values()) + ['filter_score']
+
+
+def prefilter_features(cands, s1_norm, c_norm, workers=None):
+    """Cheap features for the candidate-filtering stage that runs on every blocking
+    pair before the full feature set: block scores and ranks, three string
+    similarities, postal/house equality, and each pair's rank among its S1's and
+    its S2/S3 record's candidates. Returns a float32 DataFrame aligned with cands."""
+    workers = workers or min(4, mp.cpu_count())
+    i1 = cands['s1_idx'].to_numpy()
+    i2 = cands['c_idx'].to_numpy()
+    t = time.time()
+    out = pd.DataFrame(index=cands.index)
+    bs = cands['block_score'].to_numpy(dtype=np.float32)
+    out['block_rank'] = cands['block_rank'].to_numpy(dtype=np.float32)
+    out['block_rank_c'] = cands['block_rank_c'].to_numpy(dtype=np.float32)
+    out['block_rel'] = bs / pd.Series(bs).groupby(i1).transform('max').to_numpy()
+    out['block_rel_c'] = bs / pd.Series(bs).groupby(i2).transform('max').to_numpy()
+    out['n_cands_s1'] = np.bincount(i1)[i1].astype(np.float32)
+    out['n_s1_c'] = np.bincount(i2)[i2].astype(np.float32)
+    for feat, col, kind in (('pf_name_tsr', 'name_no_suffix', 'token_set'),
+                            ('pf_name_jw', 'name_no_suffix', 'jw'),
+                            ('pf_addr_tsr', 'addr_expanded', 'token_set')):
+        a = s1_norm[col].fillna('').to_numpy(dtype=object)[i1]
+        b = c_norm[col].fillna('').to_numpy(dtype=object)[i2]
+        out[feat] = _pairwise(a, b, kind, workers)
+        print(f"    {feat:<16} {time.time() - t:6.0f}s")
+    del a, b
+    for name, col in (('postal', 'postal_code'), ('house', 'house_number')):
+        c1, c2 = _joint_codes(s1_norm[col], c_norm[col])
+        a, b = c1[i1], c2[i2]
+        out[f'pf_{name}_eq'] = _eq(a, b)
+        out[f'pf_{name}_both'] = ((a >= 0) & (b >= 0)).astype(np.float32)
+    out['src'] = c_norm['src'].to_numpy(dtype=np.float32)[i2]
+    base = ((out['pf_name_tsr'] + out['pf_name_jw'] + out['pf_addr_tsr']) / 3).to_numpy()
+    out['pf_rank_s1'], out['pf_gap_s1'] = _group_rank_gap(i1, base)
+    out['pf_rank_c'], out['pf_gap_c'] = _group_rank_gap(i2, base)
+    print(f"  Filter features done in {time.time() - t:.0f}s")
+    return out[PREFILTER_COLS].astype(np.float32)
 
 
 def compute_features(cands, s1_norm, c_norm, workers=None):

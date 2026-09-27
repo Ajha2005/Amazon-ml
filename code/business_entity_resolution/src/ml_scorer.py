@@ -142,14 +142,66 @@ def train_and_tune(cands, labels, true_count, n_s1, model_path, params_path,
     return booster, sel_params, f05
 
 
-def feature_rows(cands, rows):
-    """float32 matrix of FEATURE_COLS for the given row positions (copies only those rows)."""
-    return np.column_stack([cands[c].to_numpy()[rows] for c in FEATURE_COLS]).astype(np.float32, copy=False)
+def feature_rows(cands, rows, cols=FEATURE_COLS):
+    """float32 matrix of `cols` for the given row positions (copies only those rows)."""
+    return np.column_stack([cands[c].to_numpy()[rows] for c in cols]).astype(np.float32, copy=False)
 
 
-def predict(booster, cands, rows=None, chunk=5_000_000):
+def predict(booster, cands, rows=None, chunk=5_000_000, cols=FEATURE_COLS):
     rows = np.arange(len(cands)) if rows is None else rows
     out = np.empty(len(rows), dtype=np.float32)
     for s in range(0, len(rows), chunk):
-        out[s:s + chunk] = booster.predict(feature_rows(cands, rows[s:s + chunk]))
+        out[s:s + chunk] = booster.predict(feature_rows(cands, rows[s:s + chunk], cols))
     return out
+
+
+# ── candidate filter (second blocking stage) ─────────────────────────────────
+
+PF_PARAMS = dict(
+    objective='binary', learning_rate=0.1, num_leaves=63, min_data_in_leaf=500,
+    feature_fraction=0.9, bagging_fraction=0.8, bagging_freq=1, lambda_l2=1.0,
+    verbose=-1, seed=42,
+)
+
+
+def train_prefilter(pf, cols, s1_idx, labels, n_s1, true_count, target_recall, model_path,
+                    val_frac=0.2, max_train_neg=10_000_000):
+    """Train the cheap candidate filter on training S1 entities and pick the lowest
+    score that still keeps `target_recall` of the true pairs blocking found for the
+    validation S1 entities (same S1 split and seed as the final model).
+    Returns (scores for every pair, threshold)."""
+    import lightgbm as lgb
+
+    rng = np.random.default_rng(42)
+    val_s1 = rng.random(n_s1) < val_frac
+    is_val = val_s1[s1_idx]
+    tr = np.flatnonzero(~is_val)
+    pos, neg = tr[labels[tr]], tr[~labels[tr]]
+    if len(neg) > max_train_neg:
+        neg = rng.choice(neg, max_train_neg, replace=False)
+    tr = np.sort(np.concatenate([pos, neg]))
+    va = np.flatnonzero(is_val)
+    es = va if len(va) <= 3_000_000 else np.sort(rng.choice(va, 3_000_000, replace=False))
+
+    t = time.time()
+    dtrain = lgb.Dataset(feature_rows(pf, tr, cols), labels[tr].astype(np.float32),
+                         feature_name=list(cols), free_raw_data=True)
+    dval = lgb.Dataset(feature_rows(pf, es, cols), labels[es].astype(np.float32), reference=dtrain)
+    booster = lgb.train(PF_PARAMS, dtrain, num_boost_round=400, valid_sets=[dval],
+                        callbacks=[lgb.early_stopping(20), lgb.log_evaluation(100)])
+    del dtrain, dval
+    booster.save_model(model_path, num_iteration=booster.best_iteration)
+    print(f"  Filter model: {booster.best_iteration} rounds in {time.time() - t:.0f}s -> {model_path}")
+
+    score = predict(booster, pf, cols=cols)
+    pos_val = score[va][labels[va]]
+    threshold = float(np.quantile(pos_val, 1 - target_recall)) if len(pos_val) else 0.0
+    keep = score >= threshold
+    total = max(int(true_count.sum()), 1)
+    print(f"  Filter threshold {threshold:.5f} keeps {target_recall:.1%} of blocking's true pairs "
+          f"(validation S1s)")
+    print(f"  Pairs: {len(score):,} -> {int(keep.sum()):,} "
+          f"({len(score) / n_s1:.1f} -> {keep.sum() / n_s1:.1f} per S1)")
+    print(f"  RECALL AFTER FILTER = {labels[keep].sum() / total:.4f} "
+          f"(blocking alone {labels.sum() / total:.4f})")
+    return score, threshold
