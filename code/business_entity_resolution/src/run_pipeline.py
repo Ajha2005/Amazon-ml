@@ -86,7 +86,7 @@ def build_pairs(mode, k, kc, df_cap):
                     lambda: get_candidates_topk(s1, c, k=k, kc=kc, df_cap=df_cap))
 
     print(f"\n[3/4] Features...")
-    feats = _cached(os.path.join(CACHE_DIR, f'{mode}_feats_bi_k{k}_kc{kc}_cap{df_cap}_{BACKEND}.pkl'),
+    feats = _cached(os.path.join(CACHE_DIR, f'{mode}_feats_v5_k{k}_kc{kc}_cap{df_cap}_{BACKEND}.pkl'),
                     lambda: compute_features(cands.copy(), s1, c))
     del cands
     s1_ids = s1['entity_id'].to_numpy(dtype=object)
