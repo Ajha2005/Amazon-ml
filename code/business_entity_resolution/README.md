@@ -13,12 +13,18 @@ pip install -r code/business_entity_resolution/requirements.txt
 
 ## Data layout
 
-Run from the submission root with the competition data in `dataset/`:
+The competition data is not in the submission zip. Unzip the submission, add the
+data as `dataset/` next to `output/` and `code/`, and run every command from that
+top-level folder (the submission root):
 
 ```
-dataset/
-  train/  train_source1.tsv  train_source2.tsv  train_source3.tsv  train_ground_truth.tsv
-  test/   test_source1.tsv   test_source2.tsv   test_source3.tsv
+<team_name>_submission/                 <- run commands from here
+├── output/                             <- matching_results.tsv, candidate_pairs.tsv
+├── code/business_entity_resolution/    <- src/, README.md, requirements.txt
+├── Documentation_template.md
+└── dataset/                            <- add the competition data here
+    ├── train/  train_source1.tsv  train_source2.tsv  train_source3.tsv  train_ground_truth.tsv
+    └── test/   test_source1.tsv   test_source2.tsv   test_source3.tsv
 ```
 
 ## Reproduce end to end
@@ -27,17 +33,20 @@ dataset/
 python -u code/business_entity_resolution/src/run_pipeline.py --mode both
 ```
 
-`--mode train` trains on the training data and writes the models to `output/`;
-`--mode test` loads them and writes the two submission files. `--mode both` does both.
+This regenerates both files in `output/` from the training and test data, using
+only the code in `code/business_entity_resolution/`. `--mode train` trains on the
+training data and writes the models to `output/`; `--mode test` loads them and
+writes the two submission files. `--mode both` does both.
 
 Defaults: `--k 10 --kc 5 --df-cap 2000 --filter-recall 0.995`. Test mode must use
 the same blocking settings as training (checked at start-up).
 
-On a 4-core, 30GB Kaggle CPU notebook, the full run takes about 3 to 3.5 hours.
-Every stage is cached under `cache/`, so a rerun resumes from the last finished
-stage; delete `cache/` to start clean.
+On a 4-core, 30GB Kaggle CPU notebook, the full run took 207 minutes.
+Every stage is cached under `cache/` at the submission root, so a rerun resumes
+from the last finished stage; delete `cache/` to start clean.
 
-Validate the output:
+Validate the output with the organizers' validator, `utils/validate_submission.py`
+from the challenge's `student_resource/` folder (it is not part of this package):
 
 ```bash
 python3 utils/validate_submission.py \
@@ -60,6 +69,9 @@ python3 utils/validate_submission.py \
 matcher scores. `matching_results.tsv` is a subset of it.
 
 ## Outputs
+
+The submission zip's `output/` holds the two submission files. A run also writes
+the trained models and tuned parameters there.
 
 | File | Contents |
 |---|---|

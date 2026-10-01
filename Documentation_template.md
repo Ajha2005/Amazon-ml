@@ -210,8 +210,9 @@ unseen country, where most of the remaining error comes from.
 ### A. Code Artefacts
 
 `code/business_entity_resolution/` contains the full pipeline, a `README.md` and a
-pinned `requirements.txt`. Entry point, run from the submission root with the data
-in `dataset/train` and `dataset/test`:
+pinned `requirements.txt`. Entry point, run from the unzipped submission's
+top-level folder with the competition data added as `dataset/train` and
+`dataset/test` next to `output/` and `code/`:
 
 ```bash
 pip install -r code/business_entity_resolution/requirements.txt
